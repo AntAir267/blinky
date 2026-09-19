@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.4" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.5" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -106,8 +106,11 @@ the image through a second lossy pass. The .raw file blinky keeps alongside is
 the camera's original JPEG bitstream.
 .TP
 .BI \-\-fps " N"
-Frame rate recorded in a clip's AVI, default 10. The camera stores no timing
-information, so this is a choice rather than a measurement.
+Frame rate recorded in a clip's AVI, default 5. The camera stores no timing
+with the frames, but it records them at a known rate: SiPix's manual states
+"approximately 3-4 frames per second" and the Blink II specification lists 5
+fps for stored clips, so 5 plays a clip at roughly the speed it happened.
+Raising it gives smoother but faster-than-real playback.
 .TP
 .BI \-\-jpeg\-quality " N"
 JPEG quality, 1 to 100. Default 92.
@@ -185,7 +188,7 @@ to 8-byte boundaries. It is not an AVI, despite libgphoto2 naming such entries
 two-field interleave as a still, so each de-interleaves to 320x240.
 .PP
 blinky splits the stream, de-interleaves every frame and writes a real MJPEG
-AVI. The camera records no timing, so the frame rate is a choice: see
+AVI at 5 fps, the rate the camera records at: see
 .BR \-\-fps .
 Rebuilding the container re-encodes each frame, which is a second lossy pass,
 so the camera's own bytes are kept in the raw folder and

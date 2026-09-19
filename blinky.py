@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.4"
+__version__ = "1.5"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -70,7 +70,12 @@ RAW_SUBDIR = "raw"
 MOVIE_EXTS = (".avi", ".bin")
 
 
-DEFAULT_CLIP_FPS = 10
+# SiPix's own manual, on making AVIs from these clips: "The camera records
+# approximately 3-4 frames per second. Setting the frame rate to 3 or 4 will
+# make the video speed match." The Blink II spec sheet lists 5 fps for stored
+# clips (15 fps is the live PC-camera mode, which is a different thing). So 5
+# plays a clip at the speed it actually happened.
+DEFAULT_CLIP_FPS = 5
 
 
 def split_clip_frames(data):
@@ -2661,9 +2666,9 @@ def add_format_options(parser):
     parser.add_argument("--fps", type=float, default=DEFAULT_CLIP_FPS,
                         metavar="N",
                         help="frame rate to record in a clip's AVI (default "
-                             "%g). The camera stores no timing information, "
-                             "so this is a choice, not a measurement"
-                             % DEFAULT_CLIP_FPS)
+                             "%g, the speed the camera actually records at). "
+                             "Raise it for smoother but faster-than-real "
+                             "playback" % DEFAULT_CLIP_FPS)
     return parser
 
 

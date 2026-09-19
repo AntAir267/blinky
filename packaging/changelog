@@ -1,3 +1,13 @@
+blinky (1.5-1) unstable; urgency=low
+
+  * Default clips to 5 fps, the rate the camera actually records at, rather
+    than the 10 fps previously guessed. SiPix's manual says "approximately
+    3-4 frames per second" for these clips and the Blink II specification
+    lists 5 fps; 15 fps is the live PC-camera mode, not stored video. The
+    old default played every clip at about twice real speed.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 10:30:00 +0000
+
 blinky (1.4-1) unstable; urgency=low
 
   * Support video clips properly, now that the format is known. A clip is

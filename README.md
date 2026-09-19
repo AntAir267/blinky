@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.4-1_all.deb
+sudo apt install ./packaging/blinky_1.5-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -177,9 +177,16 @@ blinky splits the stream, de-interleaves every frame, and writes a real MJPEG
 AVI with a proper `hdrl`/`movi`/`idx1` structure — no ffmpeg, no dependencies.
 `file` identifies the result as *"AVI, 320 x 240, 10.00 fps, Motion JPEG"*.
 
-Two honest caveats. The camera records **no timing information**, so the frame
-rate is a choice rather than a measurement; `--fps` changes it, and 10 is a
-guess that looks about right. And rebuilding the container means re-encoding
+The clips carry no timestamps, but the capture rate is documented. SiPix's own
+manual, in the section on building AVIs from exactly these clips, says: *"The
+camera records approximately 3-4 frames per second. Setting the frame rate to
+3 or 4 will make the video speed match."* The Blink II specification lists
+**5 fps** for stored clips — 15 fps is the live PC-camera mode, which is a
+different feature. So blinky defaults to 5, which plays a clip at about the
+speed it happened; `--fps` raises it for smoother but faster-than-real
+playback.
+
+One further caveat: rebuilding the container means re-encoding
 each frame to JPEG, which is a second lossy pass — the camera's untouched
 bytes are kept in `raw/` for that reason, and `blinky decode` rebuilds the
 video from them at any time. If a camera ever hands over a genuine RIFF/AVI,
