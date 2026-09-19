@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.5"
+__version__ = "1.6"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -62,6 +62,19 @@ DEFAULT_TIMEOUT_MS = 5000
 DEFAULT_CHUNK = 4096
 DEFAULT_RETRIES = 3
 RAW_SUBDIR = "raw"
+VIDEO_SUBDIR = "videos"
+GIF_SUBDIR = os.path.join("videos", "gifs")
+
+# Raw is deliberately absent from this list: it is not optional. It is the
+# only copy of what the camera actually holds -- every other file is derived
+# from it and can be rebuilt, duplicate detection fingerprints it, and
+# --delete-after verifies against it before erasing a camera that cannot
+# erase selectively. At ~100 KB a photo against an 8 MB camera, keeping it
+# costs nothing set against the risk of not having it.
+STILL_FORMATS = ("png", "jpeg", "bmp")
+VIDEO_FORMATS = ("avi", "gif")
+STILL_EXT = {"png": ".png", "jpeg": ".jpg", "bmp": ".bmp"}
+VIDEO_EXT = {"avi": ".avi", "gif": ".gif"}
 
 # Extensions a clip might end up with. blink2.c names anything with the
 # directory's movie flag set ".avi", but that is a guess from one byte: the
@@ -193,21 +206,38 @@ def decode_clip(data, log, quality=95):
     return size[0], size[1], out, partials
 
 
-def build_clip(data, avi_path, log, fps=DEFAULT_CLIP_FPS, quality=95):
-    """Turn a clip's raw bytes into a playable AVI. Returns (frames, w, h)."""
+def build_clip(data, dirs, stem, log, formats=("avi",), fps=DEFAULT_CLIP_FPS,
+               quality=95):
+    """Turn a clip's raw bytes into the requested videos.
+
+    Returns (frame count, width, height, written paths).
+    """
     _, is_avi = movie_extension(data)
     if is_avi:
         # Already a container: pass it through untouched rather than
         # re-encoding something that needs no work.
         log.info("    the camera supplied a complete AVI; copying it as-is")
-        write_file_atomically(avi_path, data)
-        return 0, 0, 0
+        os.makedirs(dirs["avi"], exist_ok=True)
+        path = os.path.join(dirs["avi"], stem + ".avi")
+        write_file_atomically(path, data)
+        return 0, 0, 0, [path]
+
     width, height, frames, partials = decode_clip(data, log, quality)
     if partials:
         log.warn("%d clip frame(s) were damaged and decoded only partially"
                  % partials)
-    write_mjpeg_avi(avi_path, frames, width, height, fps)
-    return len(frames), width, height
+    written = []
+    if "avi" in formats:
+        os.makedirs(dirs["avi"], exist_ok=True)
+        path = os.path.join(dirs["avi"], stem + ".avi")
+        write_mjpeg_avi(path, frames, width, height, fps)
+        written.append(path)
+    if "gif" in formats:
+        os.makedirs(dirs["gif"], exist_ok=True)
+        path = os.path.join(dirs["gif"], stem + ".gif")
+        write_gif(path, frames, fps)
+        written.append(path)
+    return len(frames), width, height, written
 
 
 def movie_extension(data):
@@ -251,12 +281,41 @@ def raw_dir(outdir, use_subfolder=True):
     return os.path.join(outdir, RAW_SUBDIR) if use_subfolder else outdir
 
 
+def output_dirs(outdir, use_raw_subfolder=True):
+    """Where each kind of file belongs."""
+    return {
+        "still": outdir,
+        "raw": os.path.join(outdir, RAW_SUBDIR) if use_raw_subfolder else outdir,
+        "avi": os.path.join(outdir, VIDEO_SUBDIR),
+        "gif": os.path.join(outdir, GIF_SUBDIR),
+    }
+
+
+def parse_formats(value, allowed, option):
+    """A comma-separated format list, with at least one entry."""
+    if isinstance(value, (list, tuple, set)):
+        chosen = [str(v).strip().lower() for v in value]
+    else:
+        chosen = [p.strip().lower() for p in str(value or "").split(",")]
+    chosen = [c for c in chosen if c]
+    bad = [c for c in chosen if c not in allowed]
+    if bad:
+        raise CameraError("%s: %s is not one of %s"
+                          % (option, ", ".join(bad), ", ".join(allowed)))
+    if not chosen:
+        raise CameraError("%s needs at least one of %s"
+                          % (option, ", ".join(allowed)))
+    # Keep the documented order rather than the order typed.
+    return tuple(f for f in allowed if f in chosen)
+
+
 def scan_dirs(outdir):
-    """The folder and its raw/ subfolder: both hold files we may already have."""
+    """Everywhere camera data might already be sitting."""
     dirs = [outdir]
-    sub = os.path.join(outdir, RAW_SUBDIR)
-    if os.path.isdir(sub):
-        dirs.append(sub)
+    for name in (RAW_SUBDIR, VIDEO_SUBDIR, GIF_SUBDIR):
+        path = os.path.join(outdir, name)
+        if os.path.isdir(path):
+            dirs.append(path)
     return dirs
 # Debian convention: package-shipped udev rules live under /usr/lib, and
 # /etc/udev/rules.d is reserved for local overrides. Look in both, because the
@@ -1186,18 +1245,53 @@ def write_jpeg(path, width, height, raster, quality=92):
     img.save(path, "JPEG", quality=quality, subsampling=0, optimize=True)
 
 
-def write_still(outdir, basename, width, height, raster, fmt, quality):
-    """Write the decoded still in the requested format(s). Returns paths."""
+def write_bmp(path, width, height, raster):
+    """A plain 24-bit BMP: lossless, and openable by anything, including 2001."""
+    Image = _import_pil()
+    Image.frombytes("RGB", (width, height), raster).save(path, "BMP")
+
+
+def write_still(outdir, basename, width, height, raster, formats,
+                quality=92):
+    """Write the decoded still in each requested format. Returns paths."""
     written = []
-    if fmt in ("png", "both"):
-        path = os.path.join(outdir, basename + ".png")
-        write_png(path, width, height, raster)
-        written.append(path)
-    if fmt in ("jpeg", "both"):
-        path = os.path.join(outdir, basename + ".jpg")
-        write_jpeg(path, width, height, raster, quality)
+    for fmt in STILL_FORMATS:
+        if fmt not in formats:
+            continue
+        path = os.path.join(outdir, basename + STILL_EXT[fmt])
+        if fmt == "png":
+            write_png(path, width, height, raster)
+        elif fmt == "jpeg":
+            write_jpeg(path, width, height, raster, quality)
+        else:
+            write_bmp(path, width, height, raster)
         written.append(path)
     return written
+
+
+def write_gif(path, jpeg_frames, fps=None):
+    """An animated GIF of a clip, for anything that will not play an AVI."""
+    import io
+    Image = _import_pil()
+    fps = fps or DEFAULT_CLIP_FPS
+    frames = [Image.open(io.BytesIO(f)).convert("RGB") for f in jpeg_frames]
+    if not frames:
+        raise CameraError("no frames to write")
+    tmp = path + ".part"
+    try:
+        # Pillow picks the format from the extension, and ".part" is not one.
+        frames[0].save(tmp, format="GIF", save_all=True,
+                       append_images=frames[1:],
+                       duration=int(round(1000.0 / fps)), loop=0,
+                       optimize=True)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return len(frames)
 
 
 # ---------------------------------------------------------------------------
@@ -2010,7 +2104,15 @@ def cmd_download(args, log, state):
     since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
     outdir = os.path.expanduser(args.out)
     os.makedirs(outdir, exist_ok=True)
-    rawdir = raw_dir(outdir, not args.no_raw_subfolder)
+    dirs = output_dirs(outdir, not args.no_raw_subfolder)
+    rawdir = dirs["raw"]
+    try:
+        still_formats = parse_formats(args.formats, STILL_FORMATS, "--formats")
+        video_formats = parse_formats(args.video_formats, VIDEO_FORMATS,
+                                      "--video-formats")
+    except CameraError as exc:
+        log.error(str(exc))
+        return 1
     cam = None
     failures = []
     partials = []
@@ -2067,18 +2169,18 @@ def cmd_download(args, log, state):
             else:
                 stem = "image%04d" % counter
                 counter += 1
-            exts = ((".png",) if args.format == "png"
-                    else (".jpg",) if args.format == "jpeg"
-                    else (".png", ".jpg"))
+            raw_path = os.path.join(rawdir, stem + ".raw")
+            pictures = [os.path.join(outdir, stem + STILL_EXT[f])
+                        for f in still_formats]
             if entry.is_movie:
-                # A clip is Motion JPEG, so like a still it has raw bytes to
-                # keep and a playable file to build from them.
-                raw_path = os.path.join(rawdir, stem + ".raw")
-                targets = [raw_path, os.path.join(outdir, stem + ".avi")]
+                # A clip is Motion JPEG. Whether it becomes a video or, when
+                # it holds a single frame, a picture is only known once the
+                # bytes are here, so watch for either.
+                targets = [raw_path] + pictures + [
+                    os.path.join(dirs[f], stem + VIDEO_EXT[f])
+                    for f in video_formats]
             else:
-                raw_path = os.path.join(rawdir, stem + ".raw")
-                targets = [raw_path] + [os.path.join(outdir, stem + e)
-                                        for e in exts]
+                targets = [raw_path] + pictures
 
             existing = [t for t in targets if os.path.exists(t)]
             if existing and not args.force:
@@ -2130,13 +2232,23 @@ def cmd_download(args, log, state):
                            hashlib.sha256(data).hexdigest())
 
             stem = os.path.splitext(os.path.basename(raw_path))[0]
-            if entry.is_movie:
-                avi_path = os.path.join(outdir, stem + ".avi")
+            entry_is_movie = entry.is_movie
+            if entry.is_movie and not movie_extension(data)[1] \
+                    and len(split_clip_frames(data)) == 1:
+                # A clip of exactly one frame is a photograph. A one-frame
+                # video would be useless, and would disagree with what
+                # 'blinky decode' makes of the same bytes later. A ready-made
+                # AVI reports no JPEG frames of its own, so exclude that.
+                log.info("    a single-frame clip; saving it as a picture")
+                entry_is_movie = False
+            if entry_is_movie:
                 try:
-                    n, w, h = build_clip(data, avi_path, log, args.fps)
-                    log.info("    %d frame%s at %dx%d -> %s"
-                             % (n, "" if n == 1 else "s", w, h, avi_path))
-                    saved.append(avi_path)
+                    n, w, h, made = build_clip(data, dirs, stem, log,
+                                               video_formats, args.fps)
+                    for path in made:
+                        log.info("    %d frame%s at %dx%d -> %s"
+                                 % (n, "" if n == 1 else "s", w, h, path))
+                        saved.append(path)
                 except CameraError as exc:
                     log.error("%s: could not build a video: %s"
                               % (entry.basename, exc))
@@ -2146,7 +2258,7 @@ def cmd_download(args, log, state):
             try:
                 width, height, raster, partial = decode_still(data, log)
                 for path in write_still(outdir, stem, width, height, raster,
-                                        args.format, args.jpeg_quality):
+                                        still_formats, args.jpeg_quality):
                     log.info("    decoded %dx%d%s -> %s"
                              % (width, height, " (partial)" if partial else "",
                                 path))
@@ -2457,6 +2569,13 @@ def cmd_delete(args, log, state):
 def cmd_decode(args, log, state):
     state.offline = True
     paths = [os.path.expanduser(p) for p in args.files]
+    try:
+        still_formats = parse_formats(args.formats, STILL_FORMATS, "--formats")
+        video_formats = parse_formats(args.video_formats, VIDEO_FORMATS,
+                                      "--video-formats")
+    except CameraError as exc:
+        log.error(str(exc))
+        return 1
     outdir = os.path.expanduser(args.out) if args.out else None
     if outdir:
         os.makedirs(outdir, exist_ok=True)
@@ -2468,8 +2587,7 @@ def cmd_decode(args, log, state):
             continue
         base = os.path.splitext(os.path.basename(path))[0]
         target_dir = outdir or os.path.dirname(os.path.abspath(path))
-        exts = ((".png",) if args.format == "png"
-                else (".jpg",) if args.format == "jpeg" else (".png", ".jpg"))
+        exts = [STILL_EXT[f] for f in still_formats]
         existing = [os.path.join(target_dir, base + e) for e in exts
                     if os.path.exists(os.path.join(target_dir, base + e))]
         if existing and not args.force:
@@ -2482,19 +2600,23 @@ def cmd_decode(args, log, state):
             # A clip's raw file holds many frames; decoding only the first
             # would quietly turn a video into a photograph.
             if len(split_clip_frames(data)) > 1:
-                avi_path = os.path.join(target_dir, base + ".avi")
-                if os.path.exists(avi_path) and not args.force:
-                    log.out("%s: skipped, %s already exists" % (path, avi_path))
+                dirs = output_dirs(target_dir)
+                made = [os.path.join(dirs[f], base + VIDEO_EXT[f])
+                        for f in video_formats]
+                there = [m for m in made if os.path.exists(m)]
+                if there and not args.force:
+                    log.out("%s: skipped, %s already exists" % (path, there[0]))
                     skipped += 1
                     continue
-                n, w, h = build_clip(data, avi_path, log, args.fps)
+                n, w, h, made = build_clip(data, dirs, base, log,
+                                           video_formats, args.fps)
                 log.out("%s -> %s  (%d frames at %dx%d)"
-                        % (path, avi_path, n, w, h))
+                        % (path, ", ".join(made), n, w, h))
                 done += 1
                 continue
             width, height, raster, partial = decode_still(data, log)
             written = write_still(target_dir, base, width, height, raster,
-                                  args.format, args.jpeg_quality)
+                                  still_formats, args.jpeg_quality)
             log.out("%s -> %s  (%dx%d%s)"
                     % (path, ", ".join(written), width, height,
                        ", partial: the JPEG is damaged" if partial else ""))
@@ -2655,12 +2777,18 @@ def add_common_options(parser):
 
 
 def add_format_options(parser):
-    parser.add_argument("--format", choices=("png", "jpeg", "both"),
-                        default="png",
-                        help="picture format for stills (default png). The "
-                             "camera's data is already JPEG, so png is "
-                             "lossless from the decoded pixels while jpeg "
-                             "re-encodes them a second time")
+    parser.add_argument("--formats", default="png", metavar="LIST",
+                        help="comma-separated pictures to keep for stills, "
+                             "from %s (default png); at least one is "
+                             "required. png and bmp are lossless from the "
+                             "decoded pixels, jpeg re-encodes data that is "
+                             "already JPEG. The camera's own bytes are always "
+                             "kept in raw/, because everything else is "
+                             "derived from them" % ", ".join(STILL_FORMATS))
+    parser.add_argument("--video-formats", default="avi,gif", metavar="LIST",
+                        help="comma-separated videos to keep for clips, from "
+                             "%s (default avi,gif); at least one is required"
+                             % ", ".join(VIDEO_FORMATS))
     parser.add_argument("--jpeg-quality", type=int, default=92, metavar="N",
                         help="JPEG quality 1-100 (default 92)")
     parser.add_argument("--fps", type=float, default=DEFAULT_CLIP_FPS,
@@ -2684,7 +2812,8 @@ examples:
   blinky list                       show what is on the camera
   blinky download                   fetch everything to ~/blink-pics
   blinky download --images 0,2-3    fetch selected photos
-  blinky download --format both     save PNG and JPEG
+  blinky download --formats png,bmp
+  blinky download --video-formats gif   clips as GIF only
   blinky download --delete-after    fetch everything, verify, then erase
   blinky delete --last 1            erase just the newest photo
   blinky decode ~/blink-pics/image0000.raw
@@ -2798,6 +2927,15 @@ def main(argv=None):
         parser.error("--jpeg-quality must be between 1 and 100")
     if not 0 < getattr(args, "fps", 1) <= 120:
         parser.error("--fps must be above 0 and at most 120")
+    for value, allowed, name in (
+            (getattr(args, "formats", None), STILL_FORMATS, "--formats"),
+            (getattr(args, "video_formats", None), VIDEO_FORMATS,
+             "--video-formats")):
+        if value is not None:
+            try:
+                parse_formats(value, allowed, name)
+            except CameraError as exc:
+                parser.error(str(exc))
     if getattr(args, "last", None) is not None and args.last < 1:
         parser.error("--last must be 1 or more")
 

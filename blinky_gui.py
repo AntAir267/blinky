@@ -279,83 +279,6 @@ class GelButton(QWidget):
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
 
 
-class Segmented(QWidget):
-    """An Aqua segmented control: one pill divided into pressed-in choices."""
-
-    changed = pyqtSignal(str)
-
-    def __init__(self, options, parent=None, width=None):
-        super().__init__(parent)
-        self.options = list(options)             # [(value, label), ...]
-        self.index = 0
-        self._hover = -1
-        self.setFixedHeight(22)
-        self.setFont(ui_font(8))
-        w = width or (sum(self.fontMetrics().horizontalAdvance(t) + 24
-                          for _, t in self.options))
-        self.setFixedWidth(w)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setMouseTracking(True)
-
-    def value(self):
-        return self.options[self.index][0]
-
-    def setValue(self, value):
-        for i, (v, _) in enumerate(self.options):
-            if v == value:
-                self.index = i
-                self.update()
-                return
-
-    def _hit(self, x):
-        seg = self.width() / len(self.options)
-        return max(0, min(len(self.options) - 1, int(x // seg)))
-
-    def mouseMoveEvent(self, e):
-        self._hover = self._hit(e.position().x())
-        self.update()
-
-    def leaveEvent(self, e):
-        self._hover = -1
-        self.update()
-
-    def mouseReleaseEvent(self, e):
-        i = self._hit(e.position().x())
-        if i != self.index:
-            self.index = i
-            self.update()
-            self.changed.emit(self.value())
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        paint_gel(p, r, GEL_GREY, radius=r.height() / 2)
-        seg = r.width() / len(self.options)
-        p.save()
-        path = QPainterPath()
-        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
-        p.setClipPath(path)
-        for i, (_, label) in enumerate(self.options):
-            cell = QRectF(r.left() + i * seg, r.top(), seg, r.height())
-            if i == self.index:
-                paint_gel(p, cell.adjusted(1, 1, -1, -1), GEL_BLUE,
-                          radius=(cell.height() - 2) / 2, gloss=0.42)
-            elif i == self._hover:
-                p.fillRect(cell, QColor(255, 255, 255, 90))
-            if i:
-                p.setPen(QPen(QColor(0, 0, 0, 40), 1))
-                p.drawLine(QPointF(cell.left(), r.top() + 3),
-                           QPointF(cell.left(), r.bottom() - 3))
-            p.setFont(ui_font(8, bold=(i == self.index)))
-            p.setPen(QColor("#FFFFFF") if i == self.index else INK)
-            p.drawText(cell, Qt.AlignmentFlag.AlignCenter, label)
-        p.restore()
-        p.setPen(QPen(QColor("#8CA0B8"), 1))
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(path)
-
-
 class AquaCheck(QWidget):
     """A gel checkbox with its label, in the same idiom as the buttons."""
 
@@ -1305,29 +1228,54 @@ class BlinkyWindow(QWidget):
         lay.addLayout(dest)
 
         opts = LunaGroup("Options", self)
+
+        self.still_boxes = {}
         row1 = QHBoxLayout()
-        row1.setSpacing(9)
-        fmtlabel = QLabel("Save stills as")
-        fmtlabel.setFont(ui_font(8, bold=True))
-        fmtlabel.setStyleSheet("color:#20303F;")
-        row1.addWidget(fmtlabel)
-        self.fmt = Segmented([("png", "PNG"), ("jpeg", "JPEG"),
-                              ("both", "Both")], self)
-        row1.addWidget(self.fmt)
-        self.fmtnote = QLabel("lossless from the decoded pixels")
+        row1.setSpacing(12)
+        lab = QLabel("Photos")
+        lab.setFont(ui_font(8, bold=True))
+        lab.setStyleSheet("color:#20303F;")
+        lab.setFixedWidth(46)
+        row1.addWidget(lab)
+        for key, text, on in (("png", "PNG", True), ("jpeg", "JPEG", False),
+                              ("bmp", "BMP", False)):
+            box = AquaCheck(text, on, self)
+            box.toggled.connect(
+                lambda state, k=key: self._format_toggled("still", k, state))
+            self.still_boxes[key] = box
+            row1.addWidget(box)
+        row1.addStretch(1)
+        opts.addLayout(row1)
+
+        self.video_boxes = {}
+        self.video_row = QWidget(self)
+        vrow = QHBoxLayout(self.video_row)
+        vrow.setContentsMargins(0, 0, 0, 0)
+        vrow.setSpacing(12)
+        lab = QLabel("Videos")
+        lab.setFont(ui_font(8, bold=True))
+        lab.setStyleSheet("color:#20303F;")
+        lab.setFixedWidth(46)
+        vrow.addWidget(lab)
+        for key, text in (("avi", "AVI"), ("gif", "GIF")):
+            box = AquaCheck(text, True, self.video_row)
+            box.toggled.connect(
+                lambda state, k=key: self._format_toggled("video", k, state))
+            self.video_boxes[key] = box
+            vrow.addWidget(box)
+        vrow.addStretch(1)
+        self.video_row.hide()        # shown when the camera holds a clip
+        opts.addWidget(self.video_row)
+
+        self.fmtnote = QLabel("Raw camera data is always kept in raw/")
         self.fmtnote.setFont(ui_font(8))
         self.fmtnote.setStyleSheet("color:#5B6C7D;")
-        self.fmt.changed.connect(self._format_changed)
-        row1.addWidget(self.fmtnote, 1)
-        opts.addLayout(row1)
+        self.fmtnote.setWordWrap(True)
+        opts.addWidget(self.fmtnote)
 
         self.skipdupes = AquaCheck(
             "Skip photos already in this folder, even if renamed", True, self)
         opts.addWidget(self.skipdupes)
-        self.rawsub = AquaCheck(
-            "Keep raw camera files in a raw/ subfolder", True, self)
-        self.rawsub.toggled.connect(lambda _: self._rebuild_rows())
-        opts.addWidget(self.rawsub)
         self.eraseafter = AquaCheck(
             "Erase the camera after downloading", False, self, tint="warn")
         self.eraseafter.toggled.connect(self._erase_toggled)
@@ -1397,12 +1345,21 @@ class BlinkyWindow(QWidget):
         else:
             self.showMaximized()
 
-    def _format_changed(self, value):
-        self.fmtnote.setText({
-            "png": "lossless from the decoded pixels",
-            "jpeg": "smaller, but a second lossy pass",
-            "both": "PNG and JPEG side by side",
-        }[value])
+    def _chosen(self, kind):
+        boxes = self.still_boxes if kind == "still" else self.video_boxes
+        order = blinky.STILL_FORMATS if kind == "still" else blinky.VIDEO_FORMATS
+        return tuple(k for k in order if boxes[k].isChecked())
+
+    def _format_toggled(self, kind, key, state):
+        """At least one format in each group has to stay ticked."""
+        boxes = self.still_boxes if kind == "still" else self.video_boxes
+        if not state and not self._chosen(kind):
+            boxes[key].setChecked(True)      # put it back
+            self.fmtnote.setText(
+                "At least one %s format is needed. Raw camera data is always "
+                "kept in raw/." % ("picture" if kind == "still" else "video"))
+            return
+        self.fmtnote.setText("Raw camera data is always kept in raw/")
 
     def _erase_toggled(self, on):
         self.erasenote.setVisible(on)
@@ -1561,6 +1518,7 @@ class BlinkyWindow(QWidget):
             "%d photo%s · %s KB · firmware %s"
             % (n, "" if n == 1 else "s", "{:,}".format(total // 1024),
                fw.hex(" ")))
+        self.video_row.setVisible(any(e.is_movie for e in entries))
         self._rebuild_rows()
         self.log.append("out", "Found %d photo%s on the camera."
                         % (n, "" if n == 1 else "s"))
@@ -1640,9 +1598,12 @@ class BlinkyWindow(QWidget):
             return
 
         entries, outdir = list(self.entries), self.outdir
-        fmt, quality = self.fmt.value(), 92
+        quality = 92
+        still_formats = self._chosen("still")
+        video_formats = self._chosen("video") or ("avi",)
         skip_dupes = self.skipdupes.isChecked()
-        rawdir = blinky.raw_dir(outdir, self.rawsub.isChecked())
+        dirs = blinky.output_dirs(outdir)
+        rawdir = dirs["raw"]
 
         def work(job, log):
             os.makedirs(outdir, exist_ok=True)
@@ -1691,23 +1652,29 @@ class BlinkyWindow(QWidget):
 
                     stem = "image%04d" % counter
                     counter += 1
-                    if e.is_movie:
-                        # A clip is Motion JPEG: keep the camera's bytes and
-                        # build a playable AVI from them, exactly as a still
-                        # keeps its raw and gains a picture.
-                        raw = blinky.free_path(
-                            os.path.join(rawdir, stem + ".raw"))
-                        blinky.write_file_atomically(raw, data)
-                        paths[i] = raw
-                        verified[i] = (raw, len(data),
-                                       hashlib.sha256(data).hexdigest())
-                        base = os.path.splitext(os.path.basename(raw))[0]
+                    # free_path is a belt-and-braces guard: the counter
+                    # should already be past anything on disk, but
+                    # overwriting a photo is not a mistake worth risking.
+                    raw = blinky.free_path(os.path.join(rawdir, stem + ".raw"))
+                    stem = os.path.splitext(os.path.basename(raw))[0]
+                    blinky.write_file_atomically(raw, data)
+                    paths[i] = raw
+                    verified[i] = (raw, len(data),
+                                   hashlib.sha256(data).hexdigest())
+
+                    # A clip of one frame is a photograph, so decide from the
+                    # bytes rather than the directory flag alone.
+                    is_clip = (e.is_movie
+                               and (blinky.movie_extension(data)[1]
+                                    or len(blinky.split_clip_frames(data)) > 1))
+                    if is_clip:
                         try:
-                            n, w, h = blinky.build_clip(
-                                data, os.path.join(outdir, base + ".avi"), log)
-                            log.out("%s: %d frame%s at %dx%d"
+                            n, w, h, made = blinky.build_clip(
+                                data, dirs, stem, log, video_formats)
+                            log.out("%s: %d frame%s at %dx%d -> %s"
                                     % (e.basename, n, "" if n == 1 else "s",
-                                       w, h))
+                                       w, h, ", ".join(
+                                           os.path.basename(m) for m in made)))
                             job.item.emit(i, "done")
                             states[i] = "done"
                             saved += 1
@@ -1720,20 +1687,10 @@ class BlinkyWindow(QWidget):
                             failures.append((e.basename, str(exc)))
                             failed += 1
                         continue
-
-                    # free_path is a belt-and-braces guard: the counter should
-                    # already be past anything on disk, but overwriting a
-                    # photo is not a mistake worth risking.
-                    raw = blinky.free_path(os.path.join(rawdir, stem + ".raw"))
-                    stem = os.path.splitext(os.path.basename(raw))[0]
-                    blinky.write_file_atomically(raw, data)
-                    paths[i] = raw
-                    verified[i] = (raw, len(data),
-                                   hashlib.sha256(data).hexdigest())
                     try:
                         w, h, raster, part = blinky.decode_still(data, log)
                         blinky.write_still(outdir, stem, w, h, raster,
-                                           fmt, quality)
+                                           still_formats, quality)
                         states[i] = "partial" if part else "done"
                         job.item.emit(i, states[i])
                         partial += 1 if part else 0

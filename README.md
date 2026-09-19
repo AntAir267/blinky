@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.5-1_all.deb
+sudo apt install ./packaging/blinky_1.6-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -129,68 +129,40 @@ on any command.
 ### Output layout
 
 Downloads go to `blink-pics` inside your Pictures folder by default (wherever
-XDG says that is), and the raw camera data goes into a `raw/` subfolder so the
-main folder holds only things you would want to look at:
+XDG says that is), in a fixed tree:
 
 ```
 ~/Pictures/blink-pics/
-    image0000.png
-    image0001.png
-    image0002.avi        a clip, rebuilt as a playable MJPEG AVI
+    image0000.png          pictures, in whichever formats you chose
+    image0000.jpg
     raw/
-        image0000.raw
-        image0001.raw
-        image0002.raw    the clip's Motion JPEG stream
+        image0000.raw      the camera's own bytes, always kept
+        image0002.raw
+    videos/
+        image0002.avi      clips as Motion JPEG AVI
+        gifs/
+            image0002.gif  and as animated GIF
 ```
 
-`--no-raw-subfolder` (or unticking the box in the window) keeps everything in
-one folder. Either way both locations are searched when deciding what is
-already saved and what to number next, so switching does not cause a
-re-download.
+**Pictures**: `--formats png,jpeg,bmp` — at least one required. `png` and
+`bmp` are lossless from the decoded pixels; `jpeg` re-encodes data that is
+already JPEG.
 
-Stills are saved **twice**: `imageNNNN.raw` is the exact byte stream from the
-camera, written and fsynced *before* anything tries to interpret it, and
-`imageNNNN.png` is the decoded picture. If a decode ever goes wrong, the raw
-data is still on disk and `blinky decode` can retry it without another transfer
-over a flaky link.
+**Videos**: `--video-formats avi,gif` — at least one required. In the window
+these appear only when the camera actually holds a clip.
 
-Clips are handled the same way: the camera's bytes go to `raw/`, and a
-playable `.avi` is built beside the pictures.
+**Raw is not optional.** It is the only copy of what the camera holds:
+everything else is derived from it and can be rebuilt, duplicate detection
+fingerprints it, and `--delete-after` verifies against it before erasing a
+camera that cannot erase selectively. At about 100 KB a photo against an 8 MB
+camera, keeping it costs nothing set against the risk of not having it.
 
-### Video clips
+A picture cannot be fingerprinted against the camera the way a raw can — a
+PNG, JPEG or BMP has been decoded, de-interleaved and re-encoded, so its bytes
+bear no relation to the camera's. That is the other reason raw stays.
 
-libgphoto2 names anything with the directory's movie flag set `.avi` without
-ever looking at the data, and its protocol notes on video describe *live
-streaming* and are hedged throughout ("I suspect", "Unclear"). So the stored
-format was not actually documented anywhere. Measured from real clips off
-this camera:
-
-- A clip is **Motion JPEG**: complete JFIF frames laid end to end, each padded
-  to an 8-byte boundary. It is not an AVI, and naming it `.avi` as it comes
-  off the camera produces a file nothing will play.
-- Frames are **320x120**, exactly half a still in each axis, and carry the
-  **same two-field interleave** — the discontinuity sits at `x mod 16 == 7`
-  and a phase sweep bottoms out at 8, just as it does for stills. So each
-  frame de-interleaves to **320x240**.
-
-blinky splits the stream, de-interleaves every frame, and writes a real MJPEG
-AVI with a proper `hdrl`/`movi`/`idx1` structure — no ffmpeg, no dependencies.
-`file` identifies the result as *"AVI, 320 x 240, 10.00 fps, Motion JPEG"*.
-
-The clips carry no timestamps, but the capture rate is documented. SiPix's own
-manual, in the section on building AVIs from exactly these clips, says: *"The
-camera records approximately 3-4 frames per second. Setting the frame rate to
-3 or 4 will make the video speed match."* The Blink II specification lists
-**5 fps** for stored clips — 15 fps is the live PC-camera mode, which is a
-different feature. So blinky defaults to 5, which plays a clip at about the
-speed it happened; `--fps` raises it for smoother but faster-than-real
-playback.
-
-One further caveat: rebuilding the container means re-encoding
-each frame to JPEG, which is a second lossy pass — the camera's untouched
-bytes are kept in `raw/` for that reason, and `blinky decode` rebuilds the
-video from them at any time. If a camera ever hands over a genuine RIFF/AVI,
-it is copied through untouched instead.
+A clip holding a single frame is saved as a picture rather than a one-frame
+video, and `blinky decode` agrees with `blinky download` about that.
 
 ### Deleting
 

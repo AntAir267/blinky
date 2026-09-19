@@ -1,3 +1,21 @@
+blinky (1.6-1) unstable; urgency=low
+
+  * Choose which pictures to keep: --formats png,jpeg,bmp, at least one
+    required, with checkboxes in the window. BMP is new.
+  * Choose which videos to keep: --video-formats avi,gif, at least one
+    required. Animated GIF output is new, and the window shows these
+    checkboxes only when the camera actually holds a clip.
+  * Fixed output tree: pictures at the top, the camera's bytes in raw/,
+    clips in videos/ and their GIFs in videos/gifs/.
+  * Raw files are always kept and are no longer a choice. They are the only
+    copy of what the camera holds, the basis of duplicate detection, and what
+    --delete-after verifies against; a decoded picture cannot stand in for
+    them because its bytes bear no relation to the camera's.
+  * Fix animated GIF writing, which failed because Pillow infers the format
+    from the file extension and the temporary file ended in .part.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 11:50:00 +0000
+
 blinky (1.5-1) unstable; urgency=low
 
   * Default clips to 5 fps, the rate the camera actually records at, rather

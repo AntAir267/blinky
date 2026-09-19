@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.5" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.6" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -99,11 +99,14 @@ Which photos, for example \fB0,2-4\fR. Default: all.
 .B \-\-force
 Re-download and overwrite existing files.
 .TP
-.BI \-\-format " png|jpeg|both"
-Picture format for stills, default \fBpng\fR. The camera's own data is already
-JPEG, so \fBpng\fR is lossless from the decoded pixels while \fBjpeg\fR puts
-the image through a second lossy pass. The .raw file blinky keeps alongside is
-the camera's original JPEG bitstream.
+.BI \-\-formats " LIST"
+Comma-separated pictures to keep for stills, from png, jpeg and bmp; default
+\fBpng\fR, and at least one is required. png and bmp are lossless from the
+decoded pixels, jpeg re-encodes data that is already JPEG.
+.TP
+.BI \-\-video\-formats " LIST"
+Comma-separated videos to keep for clips, from avi and gif; default
+\fBavi,gif\fR, and at least one is required.
 .TP
 .BI \-\-fps " N"
 Frame rate recorded in a clip's AVI, default 5. The camera stores no timing
@@ -174,6 +177,21 @@ Usage error.
 .TP
 .B 130
 Interrupted.
+.SH "OUTPUT LAYOUT"
+Pictures are written at the top of the output folder, the camera's own bytes
+into
+.IR raw/ ,
+clips into
+.I videos/
+and their animated GIFs into
+.IR videos/gifs/ .
+.PP
+The raw files are always kept and cannot be turned off. They are the only copy
+of what the camera holds: every other file is derived from them, duplicate
+detection fingerprints them, and \fB\-\-delete\-after\fR verifies against
+them before erasing a camera that cannot erase selectively. A picture cannot
+stand in, having been decoded, de-interleaved and re-encoded into bytes that
+bear no relation to the camera's.
 .SH FILES
 .TP
 .I /usr/lib/udev/rules.d/70-blinky-sipix.rules
