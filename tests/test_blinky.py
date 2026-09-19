@@ -962,6 +962,24 @@ def test_gui_chrome():
           len(blinky_gui.app_icon().availableSizes()) >= 6,
           blinky_gui.app_icon().availableSizes())
 
+    # The confirm dialog must size itself, not be pinned: on Wayland a
+    # frameless window learns its scale factor only after the first layout.
+    dlg = blinky_gui.ConfirmDialog("Title", "A message long enough to need "
+                                   "wrapping across more than a single line "
+                                   "so height depends on width.", "Do it")
+    dlg.adjustSize()
+    hint = dlg.sizeHint()
+    check("the dialog is at least as big as its content needs",
+          dlg.width() >= hint.width() and dlg.height() >= hint.height(),
+          (dlg.size(), hint))
+    check("its width is not pinned below the content",
+          dlg.maximumWidth() > dlg.minimumWidth(),
+          (dlg.minimumWidth(), dlg.maximumWidth()))
+    check("the message label is not clipped",
+          dlg.msg.height() >= dlg.msg.heightForWidth(dlg.msg.width()),
+          (dlg.msg.height(), dlg.msg.heightForWidth(dlg.msg.width())))
+    dlg.deleteLater()
+
     # move() is a no-op on Wayland, so dragging must go via the compositor.
     src = open(os.path.join(os.path.dirname(HERE), "blinky_gui.py")).read()
     check("dragging asks the compositor (startSystemMove)",

@@ -1,3 +1,15 @@
+blinky (1.6.1-1) unstable; urgency=low
+
+  * Fix the erase confirmation sizing badly. It pinned its width with
+    setFixedWidth while its height came from a word-wrapped label, so the
+    content had no room to grow -- and on Wayland a frameless window is told
+    its scale factor only after the first layout, so the size it settled on
+    could be wrong once scaling arrived. It is now a proper QDialog subclass
+    that sizes from its own layout, re-measures on show, and centres on the
+    window rather than relying on a monkey-patched paintEvent.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 12:40:00 +0000
+
 blinky (1.6-1) unstable; urgency=low
 
   * Choose which pictures to keep: --formats png,jpeg,bmp, at least one

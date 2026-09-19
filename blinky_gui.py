@@ -22,8 +22,9 @@ from PyQt6.QtCore import (QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
 from PyQt6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QIcon, QLinearGradient,
                          QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
                          QRadialGradient)
-from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
-                             QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
+from PyQt6.QtWidgets import (QApplication, QDialog, QFileDialog, QFrame,
+                             QGridLayout, QHBoxLayout, QLabel,
+                             QScrollArea, QSizePolicy,
                              QVBoxLayout, QWidget)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1107,6 +1108,91 @@ class ActivityLog(QScrollArea):
         self.inner.setText("")
 
 
+class ConfirmDialog(QDialog):
+    """A modal in the window's own idiom.
+
+    Sized by its layout rather than pinned: a frameless window on Wayland is
+    told its scale factor only after the first layout, so a fixed width
+    cannot grow to fit content that gets bigger when that scale arrives.
+    """
+
+    def __init__(self, title, message, confirm_text, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+        bar = TitleBar(title, self)
+        bar.close_clicked.connect(self.reject)
+        bar.minimise_clicked.connect(self.reject)
+        box.addWidget(bar)
+
+        panel = QWidget(self)
+        box.addWidget(panel, 1)
+        inner = QVBoxLayout(panel)
+        inner.setContentsMargins(18, 15, 18, 15)
+        inner.setSpacing(14)
+
+        self.msg = QLabel(message, panel)
+        self.msg.setFont(ui_font(9))
+        self.msg.setWordWrap(True)
+        self.msg.setStyleSheet("color:#20303F;")
+        self.msg.setSizePolicy(QSizePolicy.Policy.Preferred,
+                               QSizePolicy.Policy.MinimumExpanding)
+        # Enough width to wrap sensibly, without pinning the dialog.
+        self.msg.setMinimumWidth(360)
+        inner.addWidget(self.msg, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(9)
+        row.addStretch(1)
+        cancel = GelButton("Cancel", "grey", panel)
+        confirm = GelButton(confirm_text, "candy", panel,
+                            width=max(150, len(confirm_text) * 8 + 40))
+        cancel.clicked.connect(self.reject)
+        confirm.clicked.connect(self.accept)
+        row.addWidget(cancel)
+        row.addWidget(confirm)
+        inner.addLayout(row)
+
+        self.setMinimumWidth(400)
+        self.adjustSize()
+
+    def ask(self):
+        """Show it, centred on the parent, and report the answer."""
+        self.adjustSize()
+        parent = self.parentWidget()
+        if parent is not None:
+            centre = parent.frameGeometry().center()
+            self.move(centre.x() - self.width() // 2,
+                      centre.y() - self.height() // 2)
+        return self.exec() == QDialog.DialogCode.Accepted
+
+    def showEvent(self, e):
+        # The scale factor can arrive after construction, so measure again
+        # once the window is actually on screen.
+        super().showEvent(e)
+        self.adjustSize()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+        p.save()
+        p.setClipPath(path)
+        paint_pinstripes(p, self.rect())
+        p.restore()
+        p.setPen(QPen(QColor("#4C6A8E"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
 class BlinkyWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -1372,56 +1458,13 @@ class BlinkyWindow(QWidget):
 
     def _confirm_erase(self, count):
         """A plain modal in the app's own idiom, not a system dialog."""
-        from PyQt6.QtWidgets import QDialog
-        dlg = QDialog(self)
-        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint |
-                           Qt.WindowType.Dialog)
-        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        dlg.setFixedWidth(400)
-        box = QVBoxLayout(dlg)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(0)
-        bar = TitleBar("Erase the camera?", dlg)
-        bar.close_clicked.connect(dlg.reject)
-        bar.minimise_clicked.connect(dlg.reject)
-        box.addWidget(bar)
-        panel = QWidget(dlg)
-        box.addWidget(panel)
-        inner = QVBoxLayout(panel)
-        inner.setContentsMargins(16, 14, 16, 14)
-        inner.setSpacing(12)
-        msg = QLabel("All %d photo%s will be downloaded, verified on disk, and "
-                     "then erased from the camera.\n\nThe camera has no undo."
-                     % (count, "" if count == 1 else "s"))
-        msg.setFont(ui_font(9))
-        msg.setWordWrap(True)
-        msg.setStyleSheet("color:#20303F;")
-        inner.addWidget(msg)
-        rowb = QHBoxLayout()
-        rowb.addStretch(1)
-        cancel = GelButton("Cancel", "grey", dlg)
-        go = GelButton("Download and Erase", "candy", dlg, width=160)
-        cancel.clicked.connect(dlg.reject)
-        go.clicked.connect(dlg.accept)
-        rowb.addWidget(cancel)
-        rowb.addWidget(go)
-        inner.addLayout(rowb)
-
-        def paint(_):
-            p = QPainter(dlg)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            r = QRectF(dlg.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-            path = QPainterPath()
-            path.addRoundedRect(r, 7, 7)
-            p.save()
-            p.setClipPath(path)
-            paint_pinstripes(p, dlg.rect())
-            p.restore()
-            p.setPen(QPen(QColor("#4C6A8E"), 1))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawPath(path)
-        dlg.paintEvent = paint
-        return dlg.exec() == QDialog.DialogCode.Accepted
+        dlg = ConfirmDialog(
+            "Erase the camera?",
+            "All %d photo%s will be downloaded, verified on disk, and then "
+            "erased from the camera.\n\nThe camera has no undo."
+            % (count, "" if count == 1 else "s"),
+            "Download and Erase", self)
+        return dlg.ask()
 
     def _pretty(self, path):
         home = os.path.expanduser("~")
