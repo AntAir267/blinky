@@ -34,6 +34,14 @@ with each entry's address range and size.
 .B download
 Download photos. Raw bytes reach the disk before any decoding is attempted.
 .TP
+.B update
+Ask GitHub whether a newer release exists, and fetch it. The download is
+checked against the SHA256SUMS published with the release and refused if it
+does not match. With \fB\-\-check\fR it only reports; with
+\fB\-\-install\fR it runs
+.B sudo apt install
+on the downloaded package.
+.TP
 .B delete
 Erase photos from the camera. The protocol offers no per\-image delete: request
 .B 0x12
@@ -102,6 +110,16 @@ Erase the camera once the download is done. Because the camera can only erase
 everything, this is refused unless every photo on it is accounted for: nothing
 failed, \fB\-\-images\fR did not select a subset, and every file written has
 been re-read from disk and checked byte for byte.
+.SH "UPDATE OPTIONS"
+.TP
+.B \-\-check
+Only report whether a newer release exists.
+.TP
+.B \-\-install
+Install the download. This runs \fBsudo apt install\fR.
+.TP
+.BI \-\-out " DIR"
+Where to put the download. Default: a temporary folder.
 .SH "DELETE OPTIONS"
 .TP
 .B \-\-all

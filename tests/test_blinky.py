@@ -689,6 +689,88 @@ def test_gui_chrome():
     w2.close()
 
 
+def test_update(monkey_free=True):
+    section("update: version comparison and download verification")
+    import json as _json
+
+    check("1.10 is newer than 1.9, not older",
+          blinky.version_tuple("1.10") > blinky.version_tuple("1.9"))
+    check("1.1-2 is newer than 1.1-1",
+          blinky.version_tuple("1.1-2") > blinky.version_tuple("1.1-1"))
+    check("equal versions do not trigger an update",
+          blinky.version_tuple("1.1") == blinky.version_tuple("v1.1".lstrip("v")))
+
+    deb = b"fake package bytes"
+    digest = __import__("hashlib").sha256(deb).hexdigest()
+
+    def fake_release(sums_line, version="9.9"):
+        payload = _json.dumps({
+            "tag_name": "v" + version,
+            "body": "notes here",
+            "assets": [
+                {"name": "blinky_%s-1_all.deb" % version, "size": len(deb),
+                 "browser_download_url": "https://x/deb"},
+                {"name": "SHA256SUMS", "browser_download_url": "https://x/sums"},
+            ],
+        }).encode()
+        def get(url, log, accept=None, timeout=20, allow_404=False):
+            if url.endswith("/deb"):
+                return deb
+            if url.endswith("/sums"):
+                return sums_line.encode()
+            return payload
+        return get
+
+    real_get = blinky._http_get
+    tmp = tempfile.mkdtemp()
+    a = argparse.Namespace(check=False, install=False, yes=False, out=tmp)
+
+    blinky._http_get = fake_release("%s  blinky_9.9-1_all.deb" % digest)
+    log = Log(quiet=True)
+    rc, out = quiet(blinky.cmd_update, a, log, blinky.RunState())
+    check("a good checksum downloads and verifies",
+          rc == 0 and "checksum verified" in out, out)
+    check("the package landed on disk",
+          os.path.exists(os.path.join(tmp, "blinky_9.9-1_all.deb")))
+
+    shutil.rmtree(tmp); tmp = tempfile.mkdtemp()
+    a = argparse.Namespace(check=False, install=False, yes=False, out=tmp)
+    blinky._http_get = fake_release("%s  blinky_9.9-1_all.deb" % ("0" * 64))
+    log = Log(quiet=True)
+    rc, out = quiet(blinky.cmd_update, a, log, blinky.RunState())
+    check("a bad checksum refuses", rc == 1, out + log.transcript())
+    check("and writes nothing to disk", os.listdir(tmp) == [], os.listdir(tmp))
+
+    shutil.rmtree(tmp); tmp = tempfile.mkdtemp()
+    a = argparse.Namespace(check=False, install=False, yes=False, out=tmp)
+    blinky._http_get = fake_release("%s  something-else.deb" % digest)
+    log = Log(quiet=True)
+    rc, out = quiet(blinky.cmd_update, a, log, blinky.RunState())
+    check("SHA256SUMS not covering the file refuses",
+          rc == 1 and os.listdir(tmp) == [], (rc, os.listdir(tmp)))
+
+    # Nothing newer available.
+    blinky._http_get = fake_release("x", version=blinky.__version__)
+    rc, out = quiet(blinky.cmd_update,
+                    argparse.Namespace(check=True, install=False, yes=False,
+                                       out=None),
+                    Log(quiet=True), blinky.RunState())
+    check("same version reports up to date",
+          rc == 0 and "up to date" in out, out)
+
+    # No releases at all.
+    blinky._http_get = lambda *a, **k: None
+    rc, out = quiet(blinky.cmd_update,
+                    argparse.Namespace(check=True, install=False, yes=False,
+                                       out=None),
+                    Log(quiet=True), blinky.RunState())
+    check("no releases is not an error",
+          rc == 0 and "No releases" in out, (rc, out))
+
+    blinky._http_get = real_get
+    shutil.rmtree(tmp)
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -734,6 +816,7 @@ def main():
     test_doctor(blobs)
     test_gui_erase_path(blobs)
     test_gui_chrome()
+    test_update()
     test_misc()
 
     print("\n%s" % ("-" * 60))

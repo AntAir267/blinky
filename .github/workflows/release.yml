@@ -1,0 +1,64 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(sed -n 's/^version=//p' packaging/build-deb.sh)
+          tool=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' blinky.py)
+          echo "tag=$tag package=$pkg tool=$tool"
+          # A release whose payload disagrees with its tag is worse than none.
+          if [ "$tag" != "$pkg" ] || [ "$tag" != "$tool" ]; then
+            echo "::error::tag $tag, packaging/build-deb.sh $pkg, blinky.py $tool -- these must agree" >&2
+            exit 1
+          fi
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pil libegl1 libgl1 libxkbcommon0 libdbus-1-3
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyusb pillow PyQt6
+
+      - name: Run the test suite
+        run: python3 tests/test_blinky.py
+
+      - name: Build the package
+        run: ./packaging/build-deb.sh
+
+      - name: Verify it unpacks and runs
+        run: |
+          mkdir -p /tmp/root && dpkg-deb -x packaging/blinky_*.deb /tmp/root
+          export PYTHONPATH=/tmp/root/usr/lib/python3/dist-packages
+          /tmp/root/usr/bin/blinky --version
+          test -f /tmp/root/usr/share/icons/hicolor/256x256/apps/blinky.png
+
+      - name: Checksums
+        run: |
+          cd packaging
+          sha256sum blinky_*.deb > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes=$(awk '/^blinky \(/{if (n++) exit} n' packaging/changelog)
+          gh release create "$GITHUB_REF_NAME" \
+            packaging/blinky_*.deb packaging/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "blinky ${GITHUB_REF_NAME#v}" \
+            --notes "$notes"

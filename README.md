@@ -29,6 +29,26 @@ continues to take precedence.
 
 Uninstall with `sudo apt remove blinky`.
 
+### Updating
+
+Once installed, blinky can fetch its own updates from the GitHub releases:
+
+```bash
+blinky update            # is there a newer one?
+blinky update --install  # fetch it and run sudo apt install
+```
+
+The download is checked against the `SHA256SUMS` published alongside it and
+refused if it does not match — installing a package is root-level trust, so a
+truncated or substituted file should stop before it reaches dpkg. Without
+`--install` nothing is installed; it just tells you the command.
+
+Releases are cut by tagging. Pushing a `v*` tag runs the test suite, builds
+the package, verifies it unpacks and runs, and publishes it with checksums.
+The workflow refuses to publish if the tag, `packaging/build-deb.sh` and
+`blinky.py` disagree about the version, because a release whose payload does
+not match its tag is worse than no release.
+
 ### From the source tree
 
 pyusb lives in a project venv (`.venv`) that also sees the system Pillow.
@@ -98,6 +118,7 @@ and conveniently it is what Aqua did anyway.
 | `blinky download` | Fetch photos to `~/blink-pics`: raw bytes first, then decode |
 | `blinky decode RAW...` | Decode already-saved `.raw` files to PNG (no camera needed) |
 | `blinky delete` | Erase photos from the camera |
+| `blinky update` | Fetch a newer release from GitHub |
 | `blinky convert [PATH...]` | Batch-convert `.pnm` files to PNG (no camera needed) |
 | `blinky-gui` | The window shown above |
 

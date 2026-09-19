@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 __version__ = "1.1"
@@ -64,6 +65,12 @@ DEFAULT_OUTDIR = os.path.expanduser("~/blink-pics")
 # Debian convention: package-shipped udev rules live under /usr/lib, and
 # /etc/udev/rules.d is reserved for local overrides. Look in both, because the
 # rule may have come from the blinky package or been written by hand.
+# Where updates come from. Pinned, so nothing in a downloaded file can
+# redirect a later check somewhere else.
+GITHUB_REPO = "AntAir267/blinky"
+RELEASES_API = "https://api.github.com/repos/%s/releases/latest" % GITHUB_REPO
+RELEASES_PAGE = "https://github.com/%s/releases" % GITHUB_REPO
+
 UDEV_RULE_PATHS = (
     "/usr/lib/udev/rules.d/70-blinky-sipix.rules",
     "/lib/udev/rules.d/70-blinky-sipix.rules",
@@ -1978,6 +1985,145 @@ def _delete_after_download(cam, log, entries, wanted, verified, failures,
     return 0
 
 
+def version_tuple(text):
+    """'1.10-2' -> (1, 10, 2), so 1.10 sorts above 1.9."""
+    parts = re.findall(r"\d+", text or "")
+    return tuple(int(x) for x in parts) or (0,)
+
+
+def _http_get(url, log, accept=None, timeout=20, allow_404=False):
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "blinky/%s" % __version__,
+        "Accept": accept or "application/vnd.github+json",
+    })
+    log.debug("GET %s" % url)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        # GitHub answers 404 for a repository that simply has no releases,
+        # which is a normal state, not a failure.
+        if exc.code == 404 and allow_404:
+            return None
+        raise CameraError("%s returned HTTP %s" % (url, exc.code))
+    except urllib.error.URLError as exc:
+        raise CameraError("could not reach %s: %s" % (url, exc.reason))
+    except OSError as exc:
+        raise CameraError("could not reach %s: %s" % (url, exc))
+
+
+def cmd_update(args, log, state):
+    """Check GitHub for a newer release, fetch it, and verify it."""
+    state.offline = True
+    import json
+
+    log.out("Installed: blinky %s" % __version__)
+    try:
+        raw = _http_get(RELEASES_API, log, allow_404=True)
+        info = json.loads(raw.decode("utf-8")) if raw else {}
+    except (CameraError, ValueError) as exc:
+        log.error(str(exc))
+        log.info("  Releases are listed at %s" % RELEASES_PAGE)
+        return 1
+
+    tag = str(info.get("tag_name") or "").strip()
+    if not tag:
+        log.out("")
+        log.out("No releases have been published yet.")
+        log.info("  %s" % RELEASES_PAGE)
+        return 0
+    latest = tag.lstrip("v")
+    log.out("Latest:    blinky %s" % latest)
+
+    if version_tuple(latest) <= version_tuple(__version__):
+        log.out("")
+        log.out("You are up to date.")
+        return 0
+
+    log.out("")
+    body = (info.get("body") or "").strip()
+    if body:
+        log.out("What is new in %s:" % latest)
+        for line in body.splitlines()[:20]:
+            log.out("  %s" % line)
+        log.out("")
+    if args.check:
+        log.out("Run 'blinky update' to fetch it.")
+        return 0
+
+    assets = {a.get("name"): a for a in info.get("assets") or []}
+    deb = next((n for n in assets if n.endswith(".deb")), None)
+    if deb is None:
+        log.error("release %s has no .deb attached" % tag)
+        log.info("  See %s" % RELEASES_PAGE)
+        return 1
+
+    outdir = os.path.expanduser(args.out) if args.out else tempfile.mkdtemp(
+        prefix="blinky-update-")
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, deb)
+
+    log.out("Downloading %s (%s KB)"
+            % (deb, "{:,}".format((assets[deb].get("size") or 0) // 1024)))
+    data = _http_get(assets[deb]["browser_download_url"], log,
+                     accept="application/octet-stream", timeout=120)
+
+    # Verify against the checksums published with the release. Installing a
+    # package is root-level trust, so a truncated or swapped download should
+    # stop here rather than reach dpkg.
+    if "SHA256SUMS" in assets:
+        sums = _http_get(assets["SHA256SUMS"]["browser_download_url"], log,
+                         accept="application/octet-stream").decode("utf-8")
+        want = None
+        for line in sums.splitlines():
+            bits = line.split()
+            if len(bits) == 2 and bits[1].lstrip("*") == deb:
+                want = bits[0]
+        got = hashlib.sha256(data).hexdigest()
+        if want is None:
+            log.error("SHA256SUMS does not mention %s; refusing" % deb)
+            return 1
+        if want != got:
+            log.error("checksum mismatch for %s" % deb)
+            log.info("  published: %s" % want)
+            log.info("  downloaded: %s" % got)
+            log.info("  Nothing was installed. Try again, and if it persists "
+                     "report it at %s" % RELEASES_PAGE)
+            return 1
+        log.out("  checksum verified against the release's SHA256SUMS")
+    else:
+        log.warn("this release publishes no SHA256SUMS, so the download "
+                 "could not be verified")
+
+    write_file_atomically(path, data)
+    log.out("  saved to %s" % path)
+
+    cmd = ["sudo", "apt", "install", "-y" if args.yes else "", path]
+    cmd = [c for c in cmd if c]
+    if not args.install:
+        log.out("")
+        log.out("To install it:")
+        log.out("  sudo apt install %s" % path)
+        log.out("Then close and reopen the Blinky window if it is running.")
+        return 0
+
+    log.out("")
+    log.out("Installing (this needs sudo)")
+    try:
+        rc = subprocess.call(cmd)
+    except OSError as exc:
+        log.error("could not run apt: %s" % exc)
+        return 1
+    if rc:
+        log.error("apt exited %d; nothing was changed" % rc)
+        return 1
+    log.out("Installed blinky %s." % latest)
+    log.out("Close and reopen the Blinky window if it is running.")
+    return 0
+
+
 def cmd_delete(args, log, state):
     """Erase the camera. Destructive, irreversible, and always confirmed."""
     since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
@@ -2267,6 +2413,8 @@ examples:
   blinky delete --last 1            erase just the newest photo
   blinky decode ~/blink-pics/image0000.raw
   blinky convert ~/blink-pics       batch .pnm -> .png, originals kept
+  blinky update                    check GitHub for a newer release
+  blinky update --install          ... and install it
 
 Stills are saved twice: the exact bytes from the camera as imageNNNN.raw,
 and the decoded picture as imageNNNN.png. Video clips need no decoding, so
@@ -2303,6 +2451,18 @@ imageNNNN.avi is itself the untouched raw data.
                         "verified on disk (refused if anything failed, or if "
                         "--images selected only some of them)")
     p.set_defaults(func=cmd_download)
+
+    p = add_common_options(sub.add_parser(
+        "update", help="check GitHub for a newer release"))
+    p.add_argument("--check", action="store_true",
+                   help="only report whether one is available")
+    p.add_argument("--install", action="store_true",
+                   help="install it once downloaded (runs sudo apt)")
+    p.add_argument("--yes", action="store_true",
+                   help="with --install, do not prompt")
+    p.add_argument("--out", metavar="DIR",
+                   help="where to put the download (default: a temp folder)")
+    p.set_defaults(func=cmd_update)
 
     p = add_common_options(sub.add_parser(
         "delete", help="erase photos from the camera"))
