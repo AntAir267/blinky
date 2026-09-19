@@ -745,6 +745,38 @@ class GuiLog(blinky.Log):
         self.sink("error", str(msg))
 
 
+class ElidedLabel(QLabel):
+    """A label that shortens with an ellipsis instead of being cut off.
+
+    Paths elide in the middle, so both the root and the folder stay legible;
+    prose elides at the end. The full text stays available as a tooltip.
+    """
+
+    def __init__(self, text="", mode=Qt.TextElideMode.ElideMiddle, parent=None):
+        super().__init__(parent)
+        self._full = text
+        self._mode = mode
+        self.setMinimumWidth(40)
+        super().setText(text)
+
+    def setText(self, text):
+        self._full = text
+        self._apply()
+
+    def fullText(self):
+        return self._full
+
+    def _apply(self):
+        avail = max(10, self.width() - 4)
+        shown = self.fontMetrics().elidedText(self._full, self._mode, avail)
+        super().setText(shown)
+        self.setToolTip(self._full if shown != self._full else "")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._apply()
+
+
 class ActivityLog(QScrollArea):
     """The Activity panel. Sunken, mono-ish, with coloured levels."""
 
@@ -839,7 +871,7 @@ class BlinkyWindow(QWidget):
         idline.addWidget(self.status)
         idline.addStretch(1)
         col.addLayout(idline)
-        self.detail = QLabel("—")
+        self.detail = ElidedLabel("—", Qt.TextElideMode.ElideRight, self)
         self.detail.setFont(ui_font(8))
         self.detail.setStyleSheet("color:#5B6C7D;")
         col.addWidget(self.detail)
@@ -899,7 +931,8 @@ class BlinkyWindow(QWidget):
         tag.setFont(ui_font(8, bold=True))
         tag.setStyleSheet("color:#20303F;")
         dest.addWidget(tag)
-        self.destlabel = QLabel(self._pretty(self.outdir))
+        self.destlabel = ElidedLabel(self._pretty(self.outdir),
+                                     Qt.TextElideMode.ElideMiddle, self)
         self.destlabel.setFont(ui_font(8))
         self.destlabel.setStyleSheet(
             "color:#12447E; background:#FFFFFF; border:1px solid #A8BACF;"
@@ -1099,6 +1132,7 @@ class BlinkyWindow(QWidget):
             cam = blinky.Blink2(log)
             cam.open()
             saved = failed = partial = 0
+            states = {}
             try:
                 for i, e in enumerate(entries):
                     job.item.emit(i, "busy")
@@ -1109,6 +1143,7 @@ class BlinkyWindow(QWidget):
                     except blinky.CameraError as exc:
                         log.error("%s: %s" % (e.basename, exc))
                         job.item.emit(i, "failed")
+                        states[i] = "failed"
                         failed += 1
                         continue
                     if e.is_movie:
@@ -1116,6 +1151,7 @@ class BlinkyWindow(QWidget):
                         blinky.write_file_atomically(
                             os.path.join(outdir, e.basename + ".avi"), data)
                         job.item.emit(i, "done")
+                        states[i] = "done"
                         saved += 1
                         continue
                     raw = os.path.join(outdir, e.basename + ".raw")
@@ -1125,16 +1161,18 @@ class BlinkyWindow(QWidget):
                         blinky.write_png(
                             os.path.join(outdir, e.basename + ".png"),
                             w, h, raster)
-                        job.item.emit(i, "partial" if part else "done")
+                        states[i] = "partial" if part else "done"
+                        job.item.emit(i, states[i])
                         partial += 1 if part else 0
                         saved += 1
                     except blinky.CameraError as exc:
                         log.error("%s: decode failed: %s" % (e.basename, exc))
                         log.info("the raw data is kept at %s" % raw)
                         job.item.emit(i, "failed")
+                        states[i] = "failed"
                         failed += 1
                 job.step.emit(1.0, "")
-                return saved, failed, partial
+                return saved, failed, partial, states
             finally:
                 cam.close()
 
@@ -1144,7 +1182,7 @@ class BlinkyWindow(QWidget):
         self.start(work, self._downloaded, "Downloading…")
 
     def _downloaded(self, result):
-        saved, failed, partial = result
+        saved, failed, partial, states = result
         self.led.set_state("ok" if not failed else "bad")
         self.status.setText("Saved %d photo%s" % (saved, "" if saved == 1 else "s"))
         bits = ["%d saved" % saved]
@@ -1157,6 +1195,12 @@ class BlinkyWindow(QWidget):
         self.log.append("out", "Done: " + ", ".join(bits) + ".")
         self._rebuild_rows()
         for i, row in enumerate(self.rows):
+            if i in states:
+                # What actually happened beats what is on disk: a partial
+                # decode still leaves a PNG behind, and saying "saved" would
+                # hide the one photo the user needs to know about.
+                row.set_state(states[i])
+                continue
             png = os.path.join(self.outdir, row.entry.basename + ".png")
             avi = os.path.join(self.outdir, row.entry.basename + ".avi")
             if os.path.exists(png) or os.path.exists(avi):
