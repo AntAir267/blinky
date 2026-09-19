@@ -11,8 +11,8 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -27,7 +27,7 @@ jobs:
   package:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build the .deb
         run: ./packaging/build-deb.sh
       - name: Verify it unpacks and runs
@@ -36,7 +36,7 @@ jobs:
           dpkg-deb -c packaging/blinky_*.deb
           mkdir -p /tmp/root && dpkg-deb -x packaging/blinky_*.deb /tmp/root
           /tmp/root/usr/bin/blinky --version
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: blinky-deb
           path: packaging/blinky_*.deb
