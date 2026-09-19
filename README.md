@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.1-1_all.deb
+sudo apt install ./packaging/blinky_1.2-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -163,9 +163,25 @@ value as the camera's own — and `GET_MEMORY` honours a short length, so readin
 that prefix costs about 30 ms instead of the seconds a whole image takes.
 
 This means a photo is recognised after being renamed or moved, and a *different*
-photo that merely reuses a filename is not mistaken for it — it gets saved
-alongside under a free name rather than clobbering anything. `--no-skip-duplicates`
+photo that merely reuses a filename is not mistaken for it. `--no-skip-duplicates`
 falls back to matching filenames only.
+
+### Naming, and why the camera's index is not one
+
+Erase the camera and its numbering restarts at zero, so `image0000` on the
+camera today is a different picture from `image0000` in your folder from last
+week. Treating that index as an identity is how a tool ends up either skipping
+new photos or silently overwriting old ones.
+
+So by default blinky numbers new files on from the highest already in the
+output folder: if it holds `image0000`–`image0012`, the next download starts at
+`image0013`. Names stay unique across sessions and keep sorting in arrival
+order. `--naming camera` uses the camera's own index instead and adds a numeric
+suffix when the name is taken.
+
+Whether a photo is *already saved* is answered by content, never by name — in
+the window too, so a row only shows "saved" when that picture really is in the
+folder.
 
 ### Picture formats
 

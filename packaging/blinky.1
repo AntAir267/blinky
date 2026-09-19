@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.1" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.2" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -99,6 +99,15 @@ the camera's original JPEG bitstream.
 .TP
 .BI \-\-jpeg\-quality " N"
 JPEG quality, 1 to 100. Default 92.
+.TP
+.BI \-\-naming " continue|camera"
+How downloaded files are named, default \fBcontinue\fR. The camera restarts
+its numbering at zero every time it is erased, so its index is not an identity:
+photo 0 today is a different picture from photo 0 last week.
+\fBcontinue\fR numbers new photos on from the highest already in the output
+folder, so names stay unique across sessions and keep sorting in the order the
+photos arrived. \fBcamera\fR uses the camera's own index and adds a numeric
+suffix when that name is taken.
 .TP
 .B \-\-no\-skip\-duplicates
 By default a photo already present in the output folder is recognised by its

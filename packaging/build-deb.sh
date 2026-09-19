@@ -4,7 +4,7 @@ set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
 src=$(dirname "$here")
-version=1.1
+version=1.2
 revision=1
 pkg="blinky_${version}-${revision}_all"
 build="$here/build/$pkg"

@@ -149,7 +149,8 @@ def test_retries(blobs, entries):
 def dl_args(out, **kw):
     base = dict(out=out, images=None, force=False, timeout=5000, retries=3,
                 chunk=4096, verbose=False, quiet=True, format="png",
-                jpeg_quality=92, no_skip_duplicates=False, delete_after=False)
+                jpeg_quality=92, no_skip_duplicates=False, delete_after=False,
+                naming="continue")
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -186,7 +187,10 @@ def test_download(blobs):
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp2, images="1"), Log(quiet=True),
           blinky.RunState())
-    check("--images selects", sorted(os.listdir(tmp2)) == ["image0001.avi"],
+    # Names come from the output folder's own sequence, not the camera's
+    # index, so selecting entry 1 into an empty folder yields image0000.
+    check("--images selects just the one photo",
+          sorted(os.listdir(tmp2)) == ["image0000.avi"],
           sorted(os.listdir(tmp2)))
     try:
         blinky.parse_image_spec("9", 2)
@@ -228,7 +232,7 @@ def test_duplicates_and_formats(blobs):
     check("the unrelated file with the same name survived",
           kept.startswith(b"\xff\xd8different"), kept[:20])
     check("the real photo landed beside it under a free name",
-          "image0000-1.raw" in os.listdir(tmp2), sorted(os.listdir(tmp2)))
+          "image0001.raw" in os.listdir(tmp2), sorted(os.listdir(tmp2)))
 
     # --no-skip-duplicates goes back to matching names only.
     tmp3 = tempfile.mkdtemp()
@@ -245,7 +249,8 @@ def test_duplicates_and_formats(blobs):
     quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
           Log(quiet=True), blinky.RunState())
     check("--no-skip-duplicates re-downloads a renamed photo",
-          "image0000.raw" in os.listdir(tmp3), sorted(os.listdir(tmp3)))
+          len([f for f in os.listdir(tmp3) if f.endswith(".raw")]) == 2,
+          sorted(os.listdir(tmp3)))
 
     # Formats.
     from PIL import Image
@@ -689,6 +694,71 @@ def test_gui_chrome():
     w2.close()
 
 
+def test_wipe_and_recapture():
+    """The camera renumbers from zero after an erase, so names collide."""
+    section("erase, reshoot: new photos must not be mistaken for old ones")
+    from simcam import make_jpeg as _mj
+    first = [(_mj(seed=s), False) for s in (1, 2, 3)]
+    second = [(_mj(seed=s), False) for s in (77, 88, 99)]
+
+    def digests(d):
+        import hashlib as _h
+        return {_h.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
+                for f in os.listdir(d) if f.endswith((".raw", ".avi"))}
+
+    def all_present(d, blobs):
+        import hashlib as _h
+        have = digests(d)
+        return all(_h.sha256(b).hexdigest() in have for b, _ in blobs)
+
+    tmp = tempfile.mkdtemp()
+    for batch in (first, second):
+        cam, sim = make_cam(batch)
+        blinky.open_camera = lambda a, l: cam
+        quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
+              blinky.RunState())
+    check("CLI keeps both sets of photos", all_present(tmp, first + second),
+          sorted(os.listdir(tmp)))
+    check("CLI numbers the new ones on from the old",
+          "image0005.raw" in os.listdir(tmp), sorted(os.listdir(tmp)))
+    check("CLI overwrote nothing",
+          len([f for f in os.listdir(tmp) if f.endswith(".raw")]) == 6,
+          sorted(os.listdir(tmp)))
+    shutil.rmtree(tmp)
+
+    # And with the camera's own numbering, the old files still survive.
+    tmp = tempfile.mkdtemp()
+    for batch in (first, second):
+        cam, sim = make_cam(batch)
+        blinky.open_camera = lambda a, l: cam
+        quiet(blinky.cmd_download, dl_args(tmp, naming="camera"),
+              Log(quiet=True), blinky.RunState())
+    check("--naming camera also loses nothing",
+          all_present(tmp, first + second), sorted(os.listdir(tmp)))
+    shutil.rmtree(tmp)
+
+    # A genuine repeat of the same photos must still be skipped.
+    tmp = tempfile.mkdtemp()
+    for _ in range(2):
+        cam, sim = make_cam(first)
+        blinky.open_camera = lambda a, l: cam
+        quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
+              blinky.RunState())
+    check("re-downloading the same photos still skips them",
+          len([f for f in os.listdir(tmp) if f.endswith(".raw")]) == 3,
+          sorted(os.listdir(tmp)))
+    shutil.rmtree(tmp)
+
+    check("next_free_index on an empty folder is 0",
+          blinky.next_free_index(tempfile.mkdtemp()) == 0)
+    d = tempfile.mkdtemp()
+    for n in ("image0000.raw", "image0007.png", "notes.txt"):
+        open(os.path.join(d, n), "wb").close()
+    check("next_free_index counts past the highest image file",
+          blinky.next_free_index(d) == 8, blinky.next_free_index(d))
+    shutil.rmtree(d)
+
+
 def test_update(monkey_free=True):
     section("update: version comparison and download verification")
     import json as _json
@@ -809,6 +879,7 @@ def main():
     test_retries(blobs, entries)
     test_download(blobs)
     test_duplicates_and_formats(blobs)
+    test_wipe_and_recapture()
     test_delete_safety(blobs)
     test_delete_command(blobs)
     test_list(blobs)

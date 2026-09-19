@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.1"
+__version__ = "1.2"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -1651,6 +1651,33 @@ def local_fingerprints(outdir, nbytes=FINGERPRINT_BYTES):
     return index
 
 
+IMAGE_NAME_RE = re.compile(r"^image(\d{4,})\b", re.I)
+
+
+def next_free_index(outdir):
+    """One past the highest imageNNNN already in the folder.
+
+    The camera's own numbering restarts at zero every time it is erased, so
+    it is not an identity: photo 0 from today is a different picture from
+    photo 0 last week. Continuing the count instead of reusing it keeps names
+    unique across sessions, keeps them sorting in the order they arrived, and
+    avoids the confusing image0000-1 pile-up that suffixing produces.
+    """
+    highest = -1
+    try:
+        names = os.listdir(outdir)
+    except OSError:
+        return 0
+    for name in names:
+        m = IMAGE_NAME_RE.match(name)
+        if m:
+            try:
+                highest = max(highest, int(m.group(1)))
+            except ValueError:
+                pass
+    return highest + 1
+
+
 def free_path(path):
     """A path that does not exist yet, by adding -1, -2 ... before the suffix."""
     if not os.path.exists(path):
@@ -1811,6 +1838,12 @@ def cmd_download(args, log, state):
                       % (len(index), outdir))
         sizes_present = {size for size, _ in index}
 
+        # The camera renumbers from zero after an erase, so its index cannot
+        # name the file. Carry on from whatever is already in the folder.
+        counter = next_free_index(outdir) if args.naming == "continue" else None
+        if counter:
+            log.info("  continuing numbering from image%04d" % counter)
+
         for i in wanted:
             entry = entries[i]
 
@@ -1830,17 +1863,22 @@ def cmd_download(args, log, state):
                     skipped.append(entry.basename)
                     continue
 
+            if counter is None:
+                stem = entry.basename
+            else:
+                stem = "image%04d" % counter
+                counter += 1
+            exts = ((".png",) if args.format == "png"
+                    else (".jpg",) if args.format == "jpeg"
+                    else (".png", ".jpg"))
             if entry.is_movie:
                 # A clip needs no decoding, so the .avi is the raw save.
-                raw_path = os.path.join(outdir, entry.basename + ".avi")
+                raw_path = os.path.join(outdir, stem + ".avi")
                 targets = [raw_path]
             else:
-                raw_path = os.path.join(outdir, entry.basename + ".raw")
-                targets = [raw_path] + [
-                    os.path.join(outdir, entry.basename + ext)
-                    for ext in ((".png",) if args.format == "png"
-                                else (".jpg",) if args.format == "jpeg"
-                                else (".png", ".jpg"))]
+                raw_path = os.path.join(outdir, stem + ".raw")
+                targets = [raw_path] + [os.path.join(outdir, stem + e)
+                                        for e in exts]
 
             existing = [t for t in targets if os.path.exists(t)]
             if existing and not args.force:
@@ -1850,12 +1888,17 @@ def cmd_download(args, log, state):
                              % (entry.basename, os.path.basename(existing[0])))
                     skipped.append(entry.basename)
                     continue
-                # Content said this is a photo we do not have, but the name is
-                # taken by a different one. Never clobber it.
+                # Content said this is a photo we do not have, but the name
+                # is taken by a different one. Never clobber it.
                 raw_path = free_path(raw_path)
                 log.info("  %s: %s is a different photo, saving as %s"
                          % (entry.basename, os.path.basename(existing[0]),
                             os.path.basename(raw_path)))
+            elif stem != entry.basename:
+                # Say what happened, not why we guess it happened: the folder
+                # simply numbers on from what it already holds.
+                log.info("  %s: saving as %s"
+                         % (entry.basename, os.path.basename(raw_path)))
 
             log.info("  %s: %s, %d bytes"
                      % (entry.basename, "AVI clip" if entry.is_movie else "still",
@@ -2442,6 +2485,12 @@ imageNNNN.avi is itself the untouched raw data.
     p.add_argument("--force", action="store_true",
                    help="re-download and overwrite existing files")
     add_format_options(p)
+    p.add_argument("--naming", choices=("continue", "camera"),
+                   default="continue",
+                   help="'continue' (default) numbers new photos on from the "
+                        "highest already in the output folder, because the "
+                        "camera restarts at zero after an erase; 'camera' "
+                        "uses the camera's own index and suffixes on a clash")
     p.add_argument("--no-skip-duplicates", action="store_true",
                    help="do not check whether a photo is already in the "
                         "output folder by content; fall back to matching "

@@ -952,24 +952,33 @@ def app_icon():
 class PhotoRow(QWidget):
     """One directory entry, with its thumbnail once it has been saved."""
 
-    def __init__(self, entry, outdir, parent=None):
+    def __init__(self, entry, outdir, parent=None, saved_path=None):
         super().__init__(parent)
         self.entry = entry
         self.outdir = outdir
         self.state = "pending"
+        # The file this photo actually lives in, once we know it. Never
+        # guessed from the camera's index, which is reused after an erase.
+        self.saved_path = saved_path
         self.setFixedHeight(42)
 
-    def set_state(self, state):
+    def set_state(self, state, saved_path=None):
         self.state = state
+        if saved_path:
+            self.saved_path = saved_path
         self.update()
 
     def _thumb(self):
-        png = os.path.join(self.outdir, self.entry.basename + ".png")
-        if os.path.exists(png):
-            pm = QPixmap(png)
-            if not pm.isNull():
-                return pm.scaled(44, 33, Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
+        if not self.saved_path:
+            return None
+        stem = os.path.splitext(self.saved_path)[0]
+        for ext in (".png", ".jpg"):
+            path = stem + ext
+            if os.path.exists(path):
+                pm = QPixmap(path)
+                if not pm.isNull():
+                    return pm.scaled(44, 33, Qt.AspectRatioMode.KeepAspectRatio,
+                                     Qt.TransformationMode.SmoothTransformation)
         return None
 
     def paintEvent(self, _):
@@ -1317,6 +1326,14 @@ class BlinkyWindow(QWidget):
         self.set_busy(False)
         QTimer.singleShot(250, self.refresh)
 
+    def closeEvent(self, e):
+        # A worker still talking to the camera must not be torn down under
+        # Qt's feet; give it a moment to finish the transfer it is in.
+        job = getattr(self, "job", None)
+        if job is not None and job.isRunning():
+            job.wait(5000)
+        super().closeEvent(e)
+
     def resizeEvent(self, e):
         super().resizeEvent(e)
         if hasattr(self, "grip"):
@@ -1471,6 +1488,8 @@ class BlinkyWindow(QWidget):
     # -- operations -------------------------------------------------------
 
     def refresh(self):
+        outdir = self.outdir
+
         def work(job, log):
             cam = blinky.Blink2(log)
             cam.open()
@@ -1478,9 +1497,24 @@ class BlinkyWindow(QWidget):
                 fw = cam.firmware_id()
                 n = cam.get_numpics()
                 entries = []
+                already = {}
                 if n:
                     entries, _, _ = cam.get_directory(n)
-                return fw, n, entries
+                    # Whether a photo is already saved is a question about
+                    # content, not about filenames: the camera renumbers from
+                    # zero after an erase, so image0000 on the camera and
+                    # image0000 in the folder are routinely different photos.
+                    index = blinky.local_fingerprints(outdir)
+                    sizes = {sz for sz, _ in index}
+                    for i, e in enumerate(entries):
+                        if e.data_bytes in sizes:
+                            try:
+                                key = cam.fingerprint(e)
+                                if key in index:
+                                    already[i] = index[key]
+                            except blinky.CameraError:
+                                pass
+                return fw, n, entries, already
             finally:
                 cam.close()
 
@@ -1488,8 +1522,9 @@ class BlinkyWindow(QWidget):
         self.start(work, self._loaded, "Reading the camera…")
 
     def _loaded(self, result):
-        fw, n, entries = result
+        fw, n, entries, already = result
         self.entries = entries
+        self.already_saved = dict(already)
         self.led.set_state("ok")
         self.status.setText("SiPix StyleCam Blink II")
         total = sum(e.data_bytes for e in entries)
@@ -1513,12 +1548,13 @@ class BlinkyWindow(QWidget):
             msg.setStyleSheet("color:#7C8B9B;")
             msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.rowbox.addWidget(msg)
-        for e in self.entries:
+        for i, e in enumerate(self.entries):
             row = PhotoRow(e, self.outdir, self)
-            png = os.path.join(self.outdir, e.basename + ".png")
-            avi = os.path.join(self.outdir, e.basename + ".avi")
-            if os.path.exists(png) or os.path.exists(avi):
-                row.set_state("done")
+            # Only content proves a photo is already saved. A file of the same
+            # name may well be a different picture from before an erase.
+            known = getattr(self, "already_saved", {})
+            if i in known:
+                row.set_state("done", known[i])
             self.rows.append(row)
             self.rowbox.addWidget(row)
         self.rowbox.addStretch(1)
@@ -1584,8 +1620,14 @@ class BlinkyWindow(QWidget):
             cam.open()
             saved = failed = partial = 0
             states, verified, failures, skipped = {}, {}, [], []
+            paths = {}
             index = blinky.local_fingerprints(outdir) if skip_dupes else {}
             sizes = {sz for sz, _ in index}
+            # The camera renumbers from zero after an erase, so carry on from
+            # what is in the folder rather than reusing its index.
+            counter = blinky.next_free_index(outdir)
+            if counter:
+                log.out("Continuing numbering from image%04d" % counter)
             try:
                 for i, e in enumerate(entries):
                     job.step.emit(i / len(entries), "Reading %s\u2026" % e.basename)
@@ -1601,6 +1643,7 @@ class BlinkyWindow(QWidget):
                                        os.path.basename(index[key])))
                             job.item.emit(i, "done")
                             states[i] = "done"
+                            paths[i] = index[key]
                             skipped.append(e.basename)
                             continue
 
@@ -1615,10 +1658,14 @@ class BlinkyWindow(QWidget):
                         failed += 1
                         continue
 
+                    stem = "image%04d" % counter
+                    counter += 1
                     if e.is_movie:
                         # A clip needs no decoding, so the .avi is the raw save.
-                        path = os.path.join(outdir, e.basename + ".avi")
+                        path = blinky.free_path(
+                            os.path.join(outdir, stem + ".avi"))
                         blinky.write_file_atomically(path, data)
+                        paths[i] = path
                         job.item.emit(i, "done")
                         states[i] = "done"
                         verified[i] = (path, len(data),
@@ -1626,13 +1673,18 @@ class BlinkyWindow(QWidget):
                         saved += 1
                         continue
 
-                    raw = os.path.join(outdir, e.basename + ".raw")
+                    # free_path is a belt-and-braces guard: the counter should
+                    # already be past anything on disk, but overwriting a
+                    # photo is not a mistake worth risking.
+                    raw = blinky.free_path(os.path.join(outdir, stem + ".raw"))
+                    stem = os.path.splitext(os.path.basename(raw))[0]
                     blinky.write_file_atomically(raw, data)
+                    paths[i] = raw
                     verified[i] = (raw, len(data),
                                    hashlib.sha256(data).hexdigest())
                     try:
                         w, h, raster, part = blinky.decode_still(data, log)
-                        blinky.write_still(outdir, e.basename, w, h, raster,
+                        blinky.write_still(outdir, stem, w, h, raster,
                                            fmt, quality)
                         states[i] = "partial" if part else "done"
                         job.item.emit(i, states[i])
@@ -1655,7 +1707,7 @@ class BlinkyWindow(QWidget):
                         cam, log, entries, list(range(len(entries))),
                         verified, failures, skipped)
                     erased = (rc == 0)
-                return saved, failed, partial, states, erased
+                return saved, failed, partial, states, erased, paths
             finally:
                 cam.close()
 
@@ -1665,7 +1717,7 @@ class BlinkyWindow(QWidget):
         self.start(work, self._downloaded, "Downloading\u2026")
 
     def _downloaded(self, result):
-        saved, failed, partial, states, erased = result
+        saved, failed, partial, states, erased, paths = result
         self.led.set_state("ok" if not failed else "bad")
         self.status.setText("Saved %d photo%s" % (saved, "" if saved == 1 else "s"))
         bits = ["%d saved" % saved]
@@ -1688,18 +1740,16 @@ class BlinkyWindow(QWidget):
             self.status.setText("Saved %d and erased the camera" % saved)
             QTimer.singleShot(400, self.refresh)
             return
+        # Remember where each photo landed so the rows show the right picture.
+        self.already_saved = dict(getattr(self, "already_saved", {}))
+        self.already_saved.update(paths)
         self._rebuild_rows()
         for i, row in enumerate(self.rows):
             if i in states:
                 # What actually happened beats what is on disk: a partial
                 # decode still leaves a PNG behind, and saying "saved" would
                 # hide the one photo the user needs to know about.
-                row.set_state(states[i])
-                continue
-            png = os.path.join(self.outdir, row.entry.basename + ".png")
-            avi = os.path.join(self.outdir, row.entry.basename + ".avi")
-            if os.path.exists(png) or os.path.exists(avi):
-                row.set_state("done")
+                row.set_state(states[i], paths.get(i))
 
 
 def main(argv=None):

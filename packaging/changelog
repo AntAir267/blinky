@@ -1,3 +1,23 @@
+blinky (1.2-1) unstable; urgency=low
+
+  * Stop treating the camera's photo index as an identity. It restarts at
+    zero after an erase, so image0000 on the camera and image0000 in the
+    output folder are routinely different pictures. Downloads now number on
+    from the highest file already in the folder; --naming camera restores the
+    old behaviour with a numeric suffix on a clash.
+  * blinky-gui: fix new photos appearing as already saved after the camera
+    was erased and reshot. A row's badge and thumbnail came from whether a
+    file of that *name* existed, so every new photo showed green with the old
+    photo's picture. Refresh now fingerprints against the folder and only
+    marks a row saved when that content really is there.
+  * blinky-gui: fix downloads silently overwriting earlier photos of the same
+    name. The window wrote straight to imageNNNN and never looked for a free
+    name, so an erase-and-reshoot destroyed the previous set.
+  * blinky-gui: wait for a running transfer when the window is closed rather
+    than tearing the worker thread down under Qt's feet.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 07:10:00 +0000
+
 blinky (1.1-1) unstable; urgency=low
 
   * Add `blinky delete`: erase everything, or the newest N photos. The
