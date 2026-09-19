@@ -620,6 +620,58 @@ def test_gui_erase_path(blobs):
     shutil.rmtree(w.outdir, ignore_errors=True)
 
 
+def test_gui_chrome():
+    """Frameless-window chrome: the parts Wayland breaks if done naively."""
+    section("GUI: title bar buttons and window move/resize")
+    try:
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import Qt as _Qt, QPoint
+        from PyQt6.QtTest import QTest
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+
+    app = QApplication.instance() or QApplication([])
+    blinky_gui.BlinkyWindow.refresh = lambda self: None
+    w = blinky_gui.BlinkyWindow()
+    w.show()
+    app.processEvents()
+
+    # A TrafficLight that does not accept the press never receives the
+    # release, because Qt sends it to whatever accepted the press -- the
+    # title bar, which is busy starting a window drag.
+    fired = []
+    w.titlebar.close_clicked.connect(lambda: fired.append("close"))
+    w.titlebar.minimise_clicked.connect(lambda: fired.append("min"))
+    w.titlebar.zoom_clicked.connect(lambda: fired.append("zoom"))
+    for light in (w.titlebar.close_light, w.titlebar.min_light,
+                  w.titlebar.zoom_light):
+        QTest.mouseClick(light, _Qt.MouseButton.LeftButton, pos=QPoint(7, 7))
+        app.processEvents()
+    check("all three title bar buttons emit their signal",
+          fired == ["close", "min", "zoom"], fired)
+
+    w2 = blinky_gui.BlinkyWindow()
+    w2.show()
+    app.processEvents()
+    w2.resize(680, 780)
+    app.processEvents()
+    check("the resize grip tracks the window corner",
+          w2.grip.geometry().topLeft() == QPoint(680 - 18, 780 - 18),
+          w2.grip.geometry().topLeft())
+
+    # move() is a no-op on Wayland, so dragging must go via the compositor.
+    src = open(os.path.join(os.path.dirname(HERE), "blinky_gui.py")).read()
+    check("dragging asks the compositor (startSystemMove)",
+          "startSystemMove" in src)
+    check("resizing asks the compositor (startSystemResize)",
+          "startSystemResize" in src)
+    w2.close()
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -664,6 +716,7 @@ def main():
     test_decode_command()
     test_doctor(blobs)
     test_gui_erase_path(blobs)
+    test_gui_chrome()
     test_misc()
 
     print("\n%s" % ("-" * 60))

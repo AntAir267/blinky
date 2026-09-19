@@ -72,6 +72,13 @@ painted rather than themed, so it looks the same on any desktop.
 It needs PyQt6 (`python3-pyqt6`). The command line tool does not, and the
 package only recommends it.
 
+The window is frameless so the chrome can be drawn rather than themed, which
+means two things have to be asked of the compositor rather than done directly:
+dragging uses `startSystemMove()` and the corner grip uses
+`startSystemResize()`. On Wayland a client may not position or resize itself,
+so `move()` silently does nothing there — which is why the grip exists at all,
+and conveniently it is what Aqua did anyway.
+
 ## Commands
 
 | Command | What it does |

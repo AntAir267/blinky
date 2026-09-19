@@ -424,6 +424,7 @@ class TrafficLight(QWidget):
         super().__init__(parent)
         self.colors = colors
         self._hover = False
+        self._down = False
         self.setFixedSize(14, 14)
         self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -435,14 +436,30 @@ class TrafficLight(QWidget):
         self._hover = False
         self.update()
 
+    def mousePressEvent(self, e):
+        # Qt's default mousePressEvent *ignores* the event, which propagates it
+        # to the title bar; the release then goes to whoever accepted the
+        # press, so without this the light never sees its own click.
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            self.update()
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
     def mouseReleaseEvent(self, e):
-        if self.rect().contains(e.position().toPoint()):
+        was_down, self._down = self._down, False
+        self.update()
+        if was_down and self.rect().contains(e.position().toPoint()):
             self.clicked.emit()
+        e.accept()
 
     def paintEvent(self, _):
         face, rim, hi = [QColor(c) for c in self.colors]
         if self._hover:
             face = face.lighter(112)
+        if self._down:
+            face = face.darker(118)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         body = QRectF(0.5, 0.5, 13, 13)
@@ -458,11 +475,46 @@ class TrafficLight(QWidget):
         p.drawEllipse(QRectF(3.2, 2.0, 7.0, 4.2))
 
 
+class ResizeGrip(QWidget):
+    """Aqua's ribbed corner grip.
+
+    A frameless window has no border for the compositor to grab, and on
+    Wayland a client cannot resize itself, so this hands the job to
+    startSystemResize -- which is also how the real thing worked.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(15, 15)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            handle = self.window().windowHandle()
+            if handle is not None:
+                handle.startSystemResize(Qt.Edge.BottomEdge | Qt.Edge.RightEdge)
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for i, inset in enumerate((3, 7, 11)):
+            p.setPen(QPen(QColor(255, 255, 255, 220), 1.6))
+            p.drawLine(QPointF(self.width() - 1.0, inset + 0.0),
+                       QPointF(inset + 0.0, self.height() - 1.0))
+            p.setPen(QPen(QColor("#7C93AE"), 1.2))
+            p.drawLine(QPointF(self.width() - 1.6, inset + 0.6),
+                       QPointF(inset + 0.6, self.height() - 1.6))
+
+
 class TitleBar(QWidget):
     """Luna's gradient and centred bold caption, with Aqua's lights at left."""
 
     close_clicked = pyqtSignal()
     minimise_clicked = pyqtSignal()
+    zoom_clicked = pyqtSignal()
 
     def __init__(self, text, parent=None):
         super().__init__(parent)
@@ -479,6 +531,7 @@ class TitleBar(QWidget):
         self.zoom_light = TrafficLight(LIGHT_GREEN, self)
         self.close_light.clicked.connect(self.close_clicked)
         self.min_light.clicked.connect(self.minimise_clicked)
+        self.zoom_light.clicked.connect(self.zoom_clicked)
         for w in (self.close_light, self.min_light, self.zoom_light):
             row.addWidget(w)
         row.addStretch(1)
@@ -492,9 +545,22 @@ class TitleBar(QWidget):
         self.update()
 
     def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        # Wayland does not let a client position its own window, so move()
+        # silently does nothing there. startSystemMove() asks the compositor
+        # to do it instead, and works on X11 too; fall back to moving by hand
+        # only if the platform refuses.
+        handle = self.window().windowHandle()
+        if handle is not None and handle.startSystemMove():
+            self._drag = None
+            return
+        self._drag = e.globalPosition().toPoint() - \
+            self.window().frameGeometry().topLeft()
+
+    def mouseDoubleClickEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
-            self._drag = e.globalPosition().toPoint() - \
-                self.window().frameGeometry().topLeft()
+            self.zoom_clicked.emit()
 
     def mouseMoveEvent(self, e):
         if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
@@ -983,6 +1049,7 @@ class BlinkyWindow(QWidget):
         self.titlebar = TitleBar("Blinky", self)
         self.titlebar.close_clicked.connect(self.close)
         self.titlebar.minimise_clicked.connect(self.showMinimized)
+        self.titlebar.zoom_clicked.connect(self._toggle_zoom)
         shell.addWidget(self.titlebar)
 
         body = QWidget(self)
@@ -1121,8 +1188,18 @@ class BlinkyWindow(QWidget):
         foot.addWidget(self.btn_download)
         lay.addLayout(foot)
 
+        self.grip = ResizeGrip(self)
+        self.grip.raise_()
+
         self.set_busy(False)
         QTimer.singleShot(250, self.refresh)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if hasattr(self, "grip"):
+            self.grip.move(self.width() - self.grip.width() - 3,
+                           self.height() - self.grip.height() - 3)
+            self.grip.setVisible(not self.isMaximized())
 
     # -- chrome -----------------------------------------------------------
 
@@ -1144,6 +1221,12 @@ class BlinkyWindow(QWidget):
         p.setPen(QPen(QColor("#4C6A8E"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+
+    def _toggle_zoom(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
 
     def _format_changed(self, value):
         self.fmtnote.setText({

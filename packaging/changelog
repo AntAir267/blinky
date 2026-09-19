@@ -13,6 +13,12 @@ blinky (1.1-1) unstable; urgency=low
   * Report a USB stall as its own condition, with the only fix that works.
   * blinky-gui: options for format, duplicate skipping and erase-after, the
     last behind a confirmation and the shared safety check.
+  * blinky-gui: fix a window that could not be moved and title bar buttons
+    that did nothing. Dragging now goes through startSystemMove, since
+    Wayland does not let a client position itself; the traffic lights accept
+    their own mouse press, without which Qt delivered the release to the
+    title bar instead; and an Aqua corner grip resizes via
+    startSystemResize. The green light and a double-click now zoom.
 
  -- antair <antairdo@gmail.com>  Fri, 18 Sep 2026 22:30:00 +0000
 
