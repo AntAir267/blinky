@@ -1,0 +1,18 @@
+# Local virtualenv (recreate with: python3 -m venv --system-site-packages .venv)
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Package build output
+packaging/build/
+packaging/*.deb
+
+# Tool output, if anyone runs it with --out inside the tree.
+# Scoped to blinky's own naming so documentation images are not swept up.
+blinky-report-*.txt
+image[0-9][0-9][0-9][0-9].raw
+image[0-9][0-9][0-9][0-9].png
+image[0-9][0-9][0-9][0-9].avi
+*.pnm

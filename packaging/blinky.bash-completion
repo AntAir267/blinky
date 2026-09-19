@@ -1,0 +1,40 @@
+_blinky() {
+    local cur prev cmds opts
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    cmds="doctor list download decode convert"
+    opts="-v --verbose -q --quiet --timeout --retries --chunk --report --help --version"
+
+    case "$prev" in
+        --out) _filedir -d; return ;;
+        --report) _filedir; return ;;
+        --timeout|--retries|--chunk|--images) return ;;
+    esac
+
+    local i cmd=""
+    for (( i=1; i < COMP_CWORD; i++ )); do
+        case "${COMP_WORDS[i]}" in
+            doctor|list|download|decode|convert) cmd="${COMP_WORDS[i]}"; break ;;
+        esac
+    done
+
+    if [ -z "$cmd" ]; then
+        COMPREPLY=( $(compgen -W "$cmds $opts" -- "$cur") )
+        return
+    fi
+
+    case "$cmd" in
+        download) opts="$opts --out --images --force" ;;
+        decode)   opts="$opts --out --force" ;;
+        convert)  opts="$opts --out --delete-originals" ;;
+    esac
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
+    else
+        case "$cmd" in
+            decode|convert) _filedir ;;
+        esac
+    fi
+}
+complete -F _blinky blinky

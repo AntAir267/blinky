@@ -1,0 +1,7 @@
+#!/bin/sh
+# Run blinky.py with the project venv, which carries pyusb (and the system Pillow).
+dir=$(dirname "$(readlink -f "$0")")
+if [ -x "$dir/.venv/bin/python" ]; then
+    exec "$dir/.venv/bin/python" "$dir/blinky.py" "$@"
+fi
+exec python3 "$dir/blinky.py" "$@"

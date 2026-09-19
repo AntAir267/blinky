@@ -1,0 +1,3 @@
+# SiPix StyleCam Blink II: grant the logged-in user access to the raw USB
+# device so blinky(1) does not need root.
+SUBSYSTEM=="usb", ATTR{idVendor}=="0c77", ATTR{idProduct}=="1011", TAG+="uaccess"

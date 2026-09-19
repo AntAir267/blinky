@@ -1,0 +1,13 @@
+blinky (1.0-1) unstable; urgency=low
+
+  * Initial release.
+  * Direct pyusb implementation of the SiPix Blink II vendor protocol.
+  * doctor: five ordered diagnostic checks with plain-language fixes, a
+    survey of free USB ports, and kernel-log correlation.
+  * download: raw bytes fsynced before decoding, whole-image retries with
+    backoff, endpoint draining between attempts.
+  * PNG output written directly from decoded pixels; clips left as AVI.
+  * convert: batch .pnm to PNG with pixel-identical verification.
+  * Ships a udev rule so the camera is usable without root.
+
+ -- antair <antairdo@gmail.com>  Fri, 18 Sep 2026 21:00:00 +0000

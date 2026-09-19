@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0
+          python -m pip install --upgrade pip
+          python -m pip install pyusb pillow
+      - name: Run the simulated-camera test suite
+        run: python tests/test_blinky.py
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the .deb
+        run: ./packaging/build-deb.sh
+      - name: Verify it unpacks and runs
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-pil
+          dpkg-deb -c packaging/blinky_*.deb
+          mkdir -p /tmp/root && dpkg-deb -x packaging/blinky_*.deb /tmp/root
+          /tmp/root/usr/bin/blinky --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blinky-deb
+          path: packaging/blinky_*.deb

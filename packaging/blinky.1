@@ -1,0 +1,114 @@
+.TH BLINKY 1 "2026-09-18" "blinky 1.0" "User Commands"
+.SH NAME
+blinky \- download and diagnose a SiPix StyleCam Blink II camera
+.SH SYNOPSIS
+.B blinky
+[\fIOPTIONS\fR]
+.I COMMAND
+[\fIARGS\fR]
+.SH DESCRIPTION
+.B blinky
+talks directly to a SiPix StyleCam Blink II (USB ID 0c77:1011) over its vendor
+protocol, reproducing what libgphoto2's
+.I camlibs/sipix/blink2.c
+does, with retries, raw-data preservation, PNG output and a built-in
+troubleshooter.
+.PP
+Stills are saved twice: \fIimageNNNN.raw\fR holds the exact byte stream from the
+camera, written and flushed to disk before anything tries to interpret it, and
+\fIimageNNNN.png\fR holds the decoded picture. Video clips need no decoding, so
+\fIimageNNNN.avi\fR is itself the untouched raw data.
+.SH COMMANDS
+.TP
+.B doctor
+Run five diagnostic checks in order, stopping at the first failure. Each failure
+is explained in plain language with the likely fix. The checks are: the camera
+is on the USB bus; the device opens without root; no other process holds it; the
+handshake works; and the directory table is the expected size and internally
+consistent.
+.TP
+.B list
+Show the firmware ID, the number of photos, and the camera's directory table
+with each entry's address range and size.
+.TP
+.B download
+Download photos. Raw bytes reach the disk before any decoding is attempted.
+.TP
+.B decode " " \fIRAW\fR...
+Decode saved .raw files to PNG. Needs no camera.
+.TP
+.B convert " " [\fIPATH\fR...]
+Batch-convert .pnm files to PNG, verifying each result is pixel-identical to its
+source. Never overwrites an existing file. Needs no camera.
+.SH OPTIONS
+These are accepted either before or after the command.
+.TP
+.BR \-v ", " \-\-verbose
+Log every transfer.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress progress output. Results and errors still print.
+.TP
+.BI \-\-timeout " MS"
+USB transfer timeout in milliseconds. Default 5000.
+.TP
+.BI \-\-retries " N"
+Retries per image after the first attempt. Default 3.
+.TP
+.BI \-\-chunk " BYTES"
+Bulk read chunk size. Default 4096.
+.TP
+.BI \-\-report " [FILE]"
+Write the check results, the relevant kernel log lines,
+.B lsusb \-v \-d 0c77:1011
+and the tool's own log into one shareable text file. Auto-named if FILE is
+omitted. If the kernel log cannot be read, blinky says so and carries on.
+.SH "DOWNLOAD OPTIONS"
+.TP
+.BI \-\-out " DIR"
+Output directory. Default ~/blink-pics.
+.TP
+.BI \-\-images " SPEC"
+Which photos, for example \fB0,2-4\fR. Default: all.
+.TP
+.B \-\-force
+Re-download and overwrite existing files.
+.SH "CONVERT OPTIONS"
+.TP
+.BI \-\-out " DIR"
+Write PNGs here instead of beside the sources.
+.TP
+.B \-\-delete\-originals
+Delete each .pnm once its PNG has verified as pixel-identical.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+A check failed, a transfer failed, or a file could not be converted.
+.TP
+.B 2
+Usage error.
+.TP
+.B 130
+Interrupted.
+.SH FILES
+.TP
+.I /usr/lib/udev/rules.d/70-blinky-sipix.rules
+Grants your login session access to the camera. Installed by this package.
+.TP
+.I ~/blink-pics
+Default output directory.
+.SH NOTES
+This camera's USB link can be fragile. Errors such as \fB-71\fR (EPROTO) or
+\fBdisabled by hub (EMI?)\fR in the kernel log are link-layer faults: the cable,
+port or hub dropped the connection, and no software change will fix them.
+.B blinky doctor
+surveys the machine for free ports and explains what it finds.
+.SH SEE ALSO
+.BR gphoto2 (1),
+.BR lsusb (8),
+.BR journalctl (1)
+.SH AUTHOR
+Protocol documented by Marcus Meissner in libgphoto2's sipix camera library.
