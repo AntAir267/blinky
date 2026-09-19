@@ -63,6 +63,24 @@ DEFAULT_CHUNK = 4096
 DEFAULT_RETRIES = 3
 RAW_SUBDIR = "raw"
 
+# Extensions a clip might end up with. blink2.c names anything with the
+# directory's movie flag set ".avi", but that is a guess from one byte: the
+# driver never inspects the data, and its own protocol notes about video are
+# hedged ("I suspect", "Unclear"). So check the bytes before claiming a format.
+MOVIE_EXTS = (".avi", ".bin")
+
+
+def movie_extension(data):
+    """(extension, recognised) for a clip's raw bytes.
+
+    An AVI file begins 'RIFF....AVI '. If that is what the camera stored,
+    say so; if not, do not put a container's extension on bytes that are not
+    in that container.
+    """
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return ".avi", True
+    return ".bin", False
+
 
 def _pictures_dir():
     """The user's Pictures folder, honouring XDG (and its localised names)."""
@@ -1677,7 +1695,7 @@ def local_fingerprints(outdir, nbytes=FINGERPRINT_BYTES):
         except OSError:
             continue
         for name in names:
-            if not name.lower().endswith((".raw", ".avi")):
+            if not name.lower().endswith((".raw",) + MOVIE_EXTS):
                 continue
             path = os.path.join(folder, name)
             try:
@@ -1913,10 +1931,11 @@ def cmd_download(args, log, state):
                     else (".jpg",) if args.format == "jpeg"
                     else (".png", ".jpg"))
             if entry.is_movie:
-                # A clip needs no decoding, so the .avi is both the raw save
-                # and the thing you watch: it stays with the pictures.
+                # A clip needs no decoding, so the saved file is both the raw
+                # data and the thing you play: it stays with the pictures.
+                # The extension is settled after the bytes arrive.
                 raw_path = os.path.join(outdir, stem + ".avi")
-                targets = [raw_path]
+                targets = [os.path.join(outdir, stem + e) for e in MOVIE_EXTS]
             else:
                 raw_path = os.path.join(rawdir, stem + ".raw")
                 targets = [raw_path] + [os.path.join(outdir, stem + e)
@@ -1962,6 +1981,18 @@ def cmd_download(args, log, state):
             log.info("    read %d bytes in %.1fs (%.1f kB/s)"
                      % (len(data), elapsed,
                         len(data) / 1024.0 / elapsed if elapsed else 0.0))
+
+            if entry.is_movie:
+                ext, known = movie_extension(data)
+                raw_path = os.path.splitext(raw_path)[0] + ext
+                if not known:
+                    log.warn("%s is flagged as a clip but its data is not an "
+                             "AVI container; saving the bytes as %s rather "
+                             "than guessing at a format"
+                             % (entry.basename, os.path.basename(raw_path)))
+                    log.info("    please report this file: the clip format "
+                             "has never been seen, so blinky cannot convert it "
+                             "yet")
 
             # Raw bytes hit the disk before anything tries to interpret them.
             os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)

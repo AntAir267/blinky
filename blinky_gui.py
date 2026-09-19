@@ -1672,9 +1672,14 @@ class BlinkyWindow(QWidget):
                     stem = "image%04d" % counter
                     counter += 1
                     if e.is_movie:
-                        # A clip needs no decoding, so the .avi is the raw save.
+                        # A clip needs no decoding; the saved file is the raw
+                        # data. Name it after the container we actually find.
+                        ext, known = blinky.movie_extension(data)
+                        if not known:
+                            log.warn("%s is flagged as a clip but is not an "
+                                     "AVI; saving as %s" % (e.basename, ext))
                         path = blinky.free_path(
-                            os.path.join(outdir, stem + ".avi"))
+                            os.path.join(outdir, stem + ext))
                         blinky.write_file_atomically(path, data)
                         paths[i] = path
                         job.item.emit(i, "done")

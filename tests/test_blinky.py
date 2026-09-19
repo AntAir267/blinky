@@ -16,7 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
 
-from simcam import make_cam, make_jpeg           # noqa: E402
+from simcam import make_cam, make_jpeg, make_avi           # noqa: E402
 import usb.core                                  # noqa: E402
 import blinky                                    # noqa: E402
 from blinky import Log, CameraError, DeviceBusy  # noqa: E402
@@ -329,6 +329,44 @@ def test_raw_subfolder(blobs):
           tree(tmp2))
     shutil.rmtree(tmp)
     shutil.rmtree(tmp2)
+
+
+def test_clip_format():
+    section("clips: name the container we find, not the one we assume")
+    check("a RIFF/AVI header is recognised",
+          blinky.movie_extension(make_avi(64)) == (".avi", True))
+    check("anything else is not called an AVI",
+          blinky.movie_extension(b"\xff\xd8\xff\xe0" + b"x" * 40)
+          == (".bin", False))
+    check("a stub too short to identify is not called an AVI",
+          blinky.movie_extension(b"RIFF") == (".bin", False))
+
+    # A clip whose bytes really are an AVI keeps the .avi name.
+    tmp = tempfile.mkdtemp()
+    cam, sim = make_cam([(make_avi(4096), True)])
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
+    check("a real AVI is saved as .avi", tree(tmp) == ["image0000.avi"],
+          tree(tmp))
+    check("and byte for byte what the camera sent",
+          open(os.path.join(tmp, "image0000.avi"), "rb").read()
+          == make_avi(4096))
+    shutil.rmtree(tmp)
+
+    # A clip in some other format must not be given a container's extension.
+    tmp = tempfile.mkdtemp()
+    mystery = b"\x00\x11\x22\x33" * 1024
+    cam, sim = make_cam([(mystery, True)])
+    blinky.open_camera = lambda a, l: cam
+    log = Log(quiet=True)
+    quiet(blinky.cmd_download, dl_args(tmp), log, blinky.RunState())
+    check("an unrecognised clip is saved as .bin", tree(tmp) == ["image0000.bin"],
+          tree(tmp))
+    check("and it says so rather than pretending",
+          "not an AVI container" in log.transcript(), log.transcript()[-200:])
+    check("the bytes are still kept exactly",
+          open(os.path.join(tmp, "image0000.bin"), "rb").read() == mystery)
+    shutil.rmtree(tmp)
 
 
 def test_delete_safety(blobs):
@@ -924,7 +962,7 @@ def test_misc():
 
 def main():
     sample = os.path.expanduser("~/blink-pics/image0000.pnm")
-    blobs = [(make_jpeg(), False), (bytes(2048), True)]
+    blobs = [(make_jpeg(), False), (make_avi(), True)]
 
     if os.path.exists(sample):
         test_decoder_against_real_pnm(sample)
@@ -938,6 +976,7 @@ def main():
     test_duplicates_and_formats(blobs)
     test_wipe_and_recapture()
     test_raw_subfolder(blobs)
+    test_clip_format()
     test_delete_safety(blobs)
     test_delete_command(blobs)
     test_list(blobs)

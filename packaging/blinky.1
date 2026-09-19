@@ -90,8 +90,8 @@ reports it.
 Keep the .raw files beside the pictures. By default they go into a
 .I raw/
 subfolder, so the main folder holds only things you would want to look at.
-Video clips stay with the pictures either way, since the .avi is both the raw
-data and the thing you watch.
+Video clips stay with the pictures either way, the saved file being both the
+raw data and the thing you play.
 .TP
 .BI \-\-images " SPEC"
 Which photos, for example \fB0,2-4\fR. Default: all.
@@ -174,6 +174,14 @@ Grants your login session access to the camera. Installed by this package.
 .TP
 .I ~/Pictures/blink-pics
 Default output directory.
+.SH "VIDEO CLIPS"
+Untested. No clip has ever been seen on this camera, and the only evidence
+they exist is a flag byte in the directory table which
+.BR blink2.c
+names ".avi" without inspecting the data. blinky checks the bytes instead: a
+RIFF/AVI header gets the .avi extension, and anything else is saved as .bin
+with a warning rather than being given a container's name it may not deserve.
+The camera's bytes are preserved exactly in both cases.
 .SH NOTES
 This camera's USB link can be fragile. Errors such as \fB-71\fR (EPROTO) or
 \fBdisabled by hub (EMI?)\fR in the kernel log are link-layer faults: the cable,

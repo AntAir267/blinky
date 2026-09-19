@@ -91,6 +91,12 @@ def make_cam(blobs, log=None, **kw):
     cam.sim = sim
     return cam, sim
 
+def make_avi(nbytes=10240):
+    """A minimal RIFF/AVI header plus filler, so clip handling can be tested."""
+    body = b"LIST" + b"\x00" * (nbytes - 16)
+    return b"RIFF" + len(body).to_bytes(4, "little") + b"AVI " + body
+
+
 def make_jpeg(w=640, h=240, seed=7):
     from PIL import Image
     img = Image.new("RGB", (w, h))

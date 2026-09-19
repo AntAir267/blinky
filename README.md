@@ -136,7 +136,7 @@ main folder holds only things you would want to look at:
 ~/Pictures/blink-pics/
     image0000.png
     image0001.png
-    image0002.avi        a clip: the raw data *is* what you watch
+    image0002.avi        a clip, saved as-is (see the note below)
     raw/
         image0000.raw
         image0001.raw
@@ -153,8 +153,24 @@ camera, written and fsynced *before* anything tries to interpret it, and
 data is still on disk and `blinky decode` can retry it without another transfer
 over a flaky link.
 
-Video clips need no decoding, so `imageNNNN.avi` **is** the untouched raw data;
+Video clips need no decoding, so the saved file **is** the untouched raw data;
 there is no separate `.raw` for a clip.
+
+#### A caveat about clips
+
+Nothing here has been tested against a real video, because no clip has ever
+been seen on this camera. The whole notion comes from one byte: the directory
+table has a flag per entry, and `blink2.c` names anything with that flag set
+`.avi` — without ever looking at the data. libgphoto2's own protocol notes on
+video are about *live streaming* over isochronous transfers, and are hedged
+throughout ("I suspect", "Unclear"), so even the author was guessing.
+
+blinky therefore checks rather than assumes. If the bytes begin `RIFF....AVI `
+it is an AVI and gets that extension; otherwise the file is saved as `.bin`
+with a warning, because putting a container's extension on bytes that are not
+in that container is just a lie that fails later. Either way the exact bytes
+are preserved, which is the part that matters — the format can be worked out
+afterwards from a real sample.
 
 ### Deleting
 
