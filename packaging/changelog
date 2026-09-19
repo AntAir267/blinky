@@ -1,3 +1,21 @@
+blinky (1.1-1) unstable; urgency=low
+
+  * Add `blinky delete`: erase everything, or the newest N photos. The
+    protocol offers nothing finer -- 0x12 erases all, 0x11 erases the last.
+    Always confirms, and refuses when there is no terminal to confirm at.
+  * Add `download --delete-after`, which erases the camera only once every
+    photo is downloaded and re-read from disk byte for byte. Refused if
+    anything failed or if --images selected only some of them.
+  * Recognise photos already in the output folder by content rather than by
+    name, using a 4 KB prefix read, so a renamed copy is not fetched again
+    and a different photo reusing a filename does not clobber it.
+  * Add --format png|jpeg|both and --jpeg-quality.
+  * Report a USB stall as its own condition, with the only fix that works.
+  * blinky-gui: options for format, duplicate skipping and erase-after, the
+    last behind a confirmation and the shared safety check.
+
+ -- antair <antairdo@gmail.com>  Fri, 18 Sep 2026 22:30:00 +0000
+
 blinky (1.0-1) unstable; urgency=low
 
   * Initial release.
