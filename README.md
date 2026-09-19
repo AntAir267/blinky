@@ -53,6 +53,25 @@ installs one for you):
 SUBSYSTEM=="usb", ATTR{idVendor}=="0c77", ATTR{idProduct}=="1011", TAG+="uaccess"
 ```
 
+## The window
+
+![Blinky](docs/screenshot.png)
+
+`blinky-gui` does the same things without the terminal: finds the camera, lists
+what is on it, downloads with a progress bar, and runs the five checks. Photos
+already in the output folder appear as thumbnails. Raw camera bytes reach the
+disk before anything decodes them, exactly as on the command line, and all
+camera work happens on a worker thread so the window never blocks.
+
+The look is a deliberate hybrid of the two desktops of 2001. Windows XP's Luna
+supplies the blue gradient title bar, the Tahoma typography and the Control
+Panel group boxes; Mac OS X's Aqua supplies the pinstripe background, the
+traffic lights, the gel buttons and the barber-pole progress bar. Every part is
+painted rather than themed, so it looks the same on any desktop.
+
+It needs PyQt6 (`python3-pyqt6`). The command line tool does not, and the
+package only recommends it.
+
 ## Commands
 
 | Command | What it does |
@@ -62,6 +81,7 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="0c77", ATTR{idProduct}=="1011", TAG+="uaccess
 | `blinky download` | Fetch photos to `~/blink-pics`: raw bytes first, then decode |
 | `blinky decode RAW...` | Decode already-saved `.raw` files to PNG (no camera needed) |
 | `blinky convert [PATH...]` | Batch-convert `.pnm` files to PNG (no camera needed) |
+| `blinky-gui` | The window shown above |
 
 Useful options: `--images 0,2-4`, `--out DIR`, `--force`, `--retries N`,
 `--timeout MS`, `-v`, and `--report [FILE]` on any command.
@@ -173,6 +193,12 @@ the connection. `blinky` is built around that:
 - Short reads, timeouts and retries are logged individually.
 - When a transfer fails, the kernel log for the run's time window is pulled in
   automatically and any USB link errors are explained inline.
+- A USB stall (`EPIPE`) is reported as what it is. The camera's firmware can
+  wedge while still sitting on the bus, answering every vendor request with a
+  stall. Clearing the halt, re-setting the configuration and resetting the
+  device were all tried against real hardware in that state and none of them
+  revive it, so blinky says so and tells you to remove power instead of
+  offering a fix that does not work.
 
 When `doctor` blames the link, its advice is built from this machine rather
 than from generic suggestions: it surveys sysfs for ports that are actually

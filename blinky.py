@@ -369,6 +369,19 @@ class NotPresent(CameraError):
     pass
 
 
+class DeviceStalled(CameraError):
+    pass
+
+
+STALL_ADVICE = (
+    "Power-cycle the camera: unplug it (or take the batteries out) for a few "
+    "seconds, then plug it back in. Clearing the USB halt, re-setting the "
+    "configuration and resetting the device have all been tried against this "
+    "camera in this state and none of them revive it -- only removing power "
+    "does."
+)
+
+
 def _import_usb():
     try:
         import usb.core
@@ -558,6 +571,14 @@ class Blink2:
         if code == errno.ENODEV or code == errno.ENOENT:
             raise NotPresent(
                 "the device disappeared from the bus while %s." % what)
+        if code == errno.EPIPE:
+            # The camera's firmware can wedge and STALL every vendor request
+            # while still sitting happily on the bus. Measured on real
+            # hardware: clear_halt, set_configuration and reset all fail to
+            # revive it, so do not pretend otherwise -- it needs power removed.
+            raise DeviceStalled(
+                "the camera stalled while %s. It is still on the bus but its "
+                "firmware has stopped answering vendor requests." % what)
         raise CameraError("USB error while %s: %s" % (what, exc))
 
     # -- primitives --------------------------------------------------------
@@ -1276,6 +1297,15 @@ def run_checks(log, timeout=DEFAULT_TIMEOUT_MS, chunk=DEFAULT_CHUNK,
             raise CameraError("photo count read returned %d byte(s), expected 2"
                               % len(raw_count))
         numpics = (raw_count[0] << 8) | raw_count[1]
+    except DeviceStalled as exc:
+        results.append(CheckResult(
+            4, title4, "FAIL", [str(exc)],
+            "The camera is on the bus and will accept a connection, but its "
+            "firmware has wedged: every vendor request comes back as a USB "
+            "stall. This is a state the camera gets into on its own; it is not "
+            "a cable, a permission or a driver problem.",
+            STALL_ADVICE))
+        return results, cam
     except (CameraError, usb.core.USBError) as exc:
         detail = [str(exc)]
         results.append(CheckResult(
@@ -1536,6 +1566,11 @@ def open_camera(args, log):
 def explain_camera_error(log, exc, since):
     """Print the failure plus whatever the kernel log says about it."""
     log.error(str(exc))
+    if isinstance(exc, DeviceStalled):
+        log.info("")
+        for line in _wrap(STALL_ADVICE):
+            log.info("  %s" % line)
+        return
     if isinstance(exc, PermissionDenied):
         explanation, fix = _udev_advice()
         log.info("")

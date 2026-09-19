@@ -4,17 +4,9 @@ Version=1.1
 Name=Blinky
 GenericName=SiPix Blink II Camera Utility
 Comment=Download photos from a SiPix StyleCam Blink II camera
-Exec=sh -c "blinky download; echo; echo Press Enter to close; read _"
+Exec=blinky-gui
 Icon=camera-photo
-Terminal=true
+Terminal=false
+StartupNotify=true
 Categories=Graphics;Photography;
 Keywords=camera;sipix;blink;photo;usb;download;
-Actions=Doctor;List;
-
-[Desktop Action Doctor]
-Name=Diagnose camera link
-Exec=sh -c "blinky doctor; echo; echo Press Enter to close; read _"
-
-[Desktop Action List]
-Name=List photos on camera
-Exec=sh -c "blinky list; echo; echo Press Enter to close; read _"

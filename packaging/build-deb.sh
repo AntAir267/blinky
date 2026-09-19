@@ -12,28 +12,52 @@ build="$here/build/$pkg"
 rm -rf "$here/build"
 mkdir -p "$build/DEBIAN" \
          "$build/usr/bin" \
+         "$build/usr/lib/python3/dist-packages" \
          "$build/usr/lib/udev/rules.d" \
          "$build/usr/share/man/man1" \
          "$build/usr/share/applications" \
          "$build/usr/share/bash-completion/completions" \
          "$build/usr/share/doc/blinky"
 
-# Debian policy wants a concrete interpreter, not /usr/bin/env.
-sed '1s|^#!/usr/bin/env python3$|#!/usr/bin/python3|' "$src/blinky.py" \
-    > "$build/usr/bin/blinky"
-chmod 755 "$build/usr/bin/blinky"
-head -1 "$build/usr/bin/blinky" | grep -qx '#!/usr/bin/python3' \
-    || { echo "shebang rewrite failed" >&2; exit 1; }
+# The code ships as importable modules, with thin launchers in /usr/bin, so
+# the GUI can import the CLI instead of duplicating any protocol work.
+mods="$build/usr/lib/python3/dist-packages"
+install -m 644 "$src/blinky.py"     "$mods/blinky.py"
+install -m 644 "$src/blinky_gui.py" "$mods/blinky_gui.py"
+
+cat > "$build/usr/bin/blinky" <<'LAUNCH'
+#!/usr/bin/python3
+import sys
+from blinky import main
+sys.exit(main())
+LAUNCH
+
+cat > "$build/usr/bin/blinky-gui" <<'LAUNCH'
+#!/usr/bin/python3
+import sys
+try:
+    from blinky_gui import main
+except ImportError as exc:
+    if "PyQt6" in str(exc):
+        sys.exit("blinky-gui needs PyQt6.\n"
+                 "  Fix: sudo apt install python3-pyqt6\n"
+                 "The command line tool, blinky(1), does not need it.")
+    raise
+sys.exit(main())
+LAUNCH
+chmod 755 "$build/usr/bin/blinky" "$build/usr/bin/blinky-gui"
 
 install -m 644 "$here/70-blinky-sipix.rules" "$build/usr/lib/udev/rules.d/"
 install -m 644 "$here/blinky.desktop"        "$build/usr/share/applications/"
 install -m 644 "$here/blinky.bash-completion" \
                "$build/usr/share/bash-completion/completions/blinky"
 install -m 644 "$here/copyright"             "$build/usr/share/doc/blinky/"
-gzip -9nc "$here/blinky.1"   > "$build/usr/share/man/man1/blinky.1.gz"
+gzip -9nc "$here/blinky.1"     > "$build/usr/share/man/man1/blinky.1.gz"
+gzip -9nc "$here/blinky-gui.1" > "$build/usr/share/man/man1/blinky-gui.1.gz"
 gzip -9nc "$here/changelog"  > "$build/usr/share/doc/blinky/changelog.Debian.gz"
 gzip -9nc "$src/README.md"   > "$build/usr/share/doc/blinky/README.md.gz"
 chmod 644 "$build/usr/share/man/man1/blinky.1.gz" \
+          "$build/usr/share/man/man1/blinky-gui.1.gz" \
           "$build/usr/share/doc/blinky/changelog.Debian.gz" \
           "$build/usr/share/doc/blinky/README.md.gz"
 
@@ -48,7 +72,7 @@ Section: graphics
 Priority: optional
 Architecture: all
 Depends: python3 (>= 3.8), python3-usb, python3-pil
-Recommends: usbutils
+Recommends: python3-pyqt6, usbutils
 Suggests: gphoto2
 Installed-Size: ${size}
 Maintainer: antair <antairdo@gmail.com>
@@ -69,6 +93,10 @@ Description: download and diagnose a SiPix StyleCam Blink II camera
  works, and whether the directory table is consistent. When the link is at
  fault it correlates the kernel log and surveys the machine for free USB ports
  rather than offering generic advice.
+ .
+ A window, blinky-gui, offers the same things without the terminal: it lists
+ what is on the camera, shows thumbnails of what has already been saved, and
+ runs the checks. It needs python3-pyqt6; the command line tool does not.
  .
  This package installs a udev rule, so the camera is usable without root.
 EOF

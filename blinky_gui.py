@@ -1,0 +1,1177 @@
+#!/usr/bin/env python3
+"""blinky-gui - a front end for the SiPix StyleCam Blink II.
+
+The look is a deliberate hybrid of the two desktops of 2001: Windows XP's
+Luna theme and Mac OS X's Aqua. Luna supplies the blue gradient title bar,
+the Tahoma typography and the Control Panel group boxes; Aqua supplies the
+pinstripe background, the traffic lights, the gel buttons and the barber-pole
+progress bar. Everything is painted rather than themed, so it looks the same
+on any desktop.
+
+All camera work is done by the blinky module on a worker thread; this file
+contains no protocol code.
+"""
+
+import os
+import sys
+import time
+
+from PyQt6.QtCore import (QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
+                          QTimer, pyqtSignal)
+from PyQt6.QtGui import (QBrush, QColor, QFont, QFontDatabase, QIcon, QLinearGradient,
+                         QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+                         QRadialGradient)
+from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QGridLayout,
+                             QHBoxLayout, QLabel, QScrollArea, QSizePolicy,
+                             QVBoxLayout, QWidget)
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import blinky                                                    # noqa: E402
+
+__version__ = blinky.__version__
+
+# ---------------------------------------------------------------------------
+# Palette
+#
+# Luna's title bar is a multi-stop vertical gradient with a bright band near
+# the top and a dark lip at the bottom; Aqua's pinstripes are a 1px line every
+# 4px over a very faintly blue white. Both are reproduced here by hand.
+# ---------------------------------------------------------------------------
+
+LUNA_STOPS = [                      # active title bar, top to bottom
+    (0.00, "#3C84E8"), (0.03, "#6FB2FB"), (0.09, "#3E8FF2"),
+    (0.40, "#1A66DC"), (0.72, "#0B4FC6"), (0.88, "#0846B4"),
+    (0.95, "#1257C4"), (1.00, "#2E74D8"),
+]
+LUNA_INACTIVE = [
+    (0.00, "#8CA9CC"), (0.10, "#A8BFD8"), (0.50, "#8FAACB"), (1.00, "#7E99BA"),
+]
+
+AQUA_BASE = QColor("#C3D5EA")       # pinstripe ground
+AQUA_STRIPE = QColor("#E6EFF9")     # pinstripe line
+PANEL_WHITE = QColor(255, 255, 255, 216)   # Aqua panels are translucent
+PANEL_BORDER = QColor("#8FA8C8")
+HEADER_TOP = QColor(224, 238, 253, 235)
+HEADER_BOT = QColor(172, 206, 240, 235)
+HEADER_TEXT = QColor("#12447E")
+INK = QColor("#20303F")
+INK_SOFT = QColor("#5B6C7D")
+
+GEL_BLUE = ["#8CC8FF", "#54A6F2", "#1462C8", "#0E4E9E"]
+GEL_GREY = ["#FFFFFF", "#F6F9FC", "#C3D0DF", "#8CA0B8"]
+GEL_CANDY = ["#FFF0C8", "#FFD066", "#E8981A", "#B87A12"]
+
+LIGHT_RED = ("#FF6257", "#D8392C", "#FFB4AC")
+LIGHT_AMBER = ("#FFBD2E", "#D79A18", "#FFE0A0")
+LIGHT_GREEN = ("#28CA42", "#17A02F", "#A8EDB4")
+
+OK_GREEN = QColor("#2E9E42")
+BAD_RED = QColor("#C33327")
+
+
+def ui_font(size=8, bold=False, family=None):
+    """Tahoma is XP's shell font; it is present here, so use the real thing."""
+    for name in ([family] if family else []) + ["Tahoma", "Verdana", "DejaVu Sans"]:
+        if name and name in QFontDatabase.families():
+            f = QFont(name, size)
+            f.setBold(bold)
+            return f
+    f = QFont()
+    f.setPointSize(size)
+    f.setBold(bold)
+    return f
+
+
+def title_font(size=9):
+    return ui_font(size, bold=True, family="Trebuchet MS")
+
+
+def vgrad(rect, stops):
+    g = QLinearGradient(QPointF(rect.topLeft()), QPointF(rect.bottomLeft()))
+    for pos, col in stops:
+        g.setColorAt(pos, QColor(col))
+    return g
+
+
+def paint_pinstripes(painter, rect):
+    """Aqua's background: a faint white line every fourth row."""
+    painter.fillRect(rect, AQUA_BASE)
+    pen = QPen(AQUA_STRIPE)
+    pen.setWidth(1)
+    painter.setPen(pen)
+    y = rect.top() - (rect.top() % 4)
+    while y < rect.bottom() + 4:
+        painter.drawLine(rect.left(), y, rect.right(), y)
+        y += 4
+
+
+def paint_gel(painter, rect, colors, radius=None, pressed=False, enabled=True,
+              gloss=1.0):
+    """An Aqua gel pill.
+
+    The tell is the gloss: a near-white lobe filling the top half that stops
+    at a crisp edge on the midline, with the body below picking up a light
+    bounce off the bottom rim. Drawn in four passes: body, gloss, inner ring,
+    outer rim.
+    """
+    if rect.height() <= 0 or rect.width() <= 0:
+        return
+    r = radius if radius is not None else rect.height() / 2.0
+    body = QRectF(rect)
+    top, upper, lower, rim = [QColor(c) for c in colors]
+    if pressed:
+        top, upper, lower = upper.darker(114), lower.darker(110), lower.darker(120)
+    if not enabled:
+        top = top.lighter(112)
+        upper = QColor(upper.lighter(126))
+        lower = QColor(lower.lighter(124))
+        rim = rim.lighter(126)
+
+    path = QPainterPath()
+    path.addRoundedRect(body, r, r)
+
+    g = QLinearGradient(body.topLeft(), body.bottomLeft())
+    g.setColorAt(0.00, upper.lighter(112))
+    g.setColorAt(0.49, upper)
+    g.setColorAt(0.50, lower)
+    g.setColorAt(0.88, lower.lighter(108))
+    g.setColorAt(1.00, lower.lighter(132))
+    painter.fillPath(path, QBrush(g))
+
+    # Gloss lobe: stops hard at the midline.
+    gloss_rect = QRectF(body.left() + 1.0, body.top() + 1.0,
+                        body.width() - 2.0, body.height() * 0.48)
+    if gloss_rect.height() > 1.5:
+        painter.save()
+        painter.setClipPath(path)
+        k = gloss * (1.0 if enabled else 0.78)
+        gg = QLinearGradient(gloss_rect.topLeft(), gloss_rect.bottomLeft())
+        gg.setColorAt(0.0, QColor(255, 255, 255, int(250 * k)))
+        gg.setColorAt(0.72, QColor(255, 255, 255, int(190 * k)))
+        gg.setColorAt(1.0, QColor(255, 255, 255, int(105 * k)))
+        gp = QPainterPath()
+        gp.addRoundedRect(gloss_rect, r * 0.92, gloss_rect.height() / 2.0)
+        painter.fillPath(gp, QBrush(gg))
+        painter.restore()
+
+    # Inner ring: bright along the top, invisible along the bottom.
+    painter.save()
+    painter.setClipPath(path)
+    inner = QPainterPath()
+    inner.addRoundedRect(body.adjusted(1, 1, -1, -1), r, r)
+    ring = QLinearGradient(body.topLeft(), body.bottomLeft())
+    ring.setColorAt(0.0, QColor(255, 255, 255, 230))
+    ring.setColorAt(0.55, QColor(255, 255, 255, 40))
+    ring.setColorAt(1.0, QColor(255, 255, 255, 150))
+    painter.setPen(QPen(QBrush(ring), 1.2))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(inner)
+    painter.restore()
+
+    painter.setPen(QPen(rim, 1))
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+
+
+def paint_sparkle(painter, cx, cy, size, colour=QColor(255, 255, 255, 220)):
+    """A four-point star. Pure 2001."""
+    painter.save()
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(colour)
+    s, w = size, size * 0.22
+    painter.drawPolygon(QPolygonF([
+        QPointF(cx, cy - s), QPointF(cx + w, cy - w), QPointF(cx + s, cy),
+        QPointF(cx + w, cy + w), QPointF(cx, cy + s), QPointF(cx - w, cy + w),
+        QPointF(cx - s, cy), QPointF(cx - w, cy - w)]))
+    painter.restore()
+
+
+class GelButton(QWidget):
+    """Aqua lozenge. The default button glows, the way Aqua's used to pulse."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text, kind="grey", parent=None, width=None):
+        super().__init__(parent)
+        self.text = text
+        self.kind = kind
+        self._down = False
+        self._hover = False
+        self._enabled = True
+        self._phase = 0.0
+        self.setFixedHeight(28)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFont(ui_font(8, bold=(kind == "blue")))
+        w = width or (self.fontMetrics().horizontalAdvance(text) + 38)
+        self.setFixedWidth(max(84, w))
+
+    def sizeHint(self):
+        return QSize(self.width(), 28)
+        if kind == "blue":
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._pulse)
+            self._timer.start(45)
+
+    def _pulse(self):
+        self._phase = (self._phase + 0.045) % 1.0
+        self.update()
+
+    def setEnabled(self, on):
+        self._enabled = on
+        super().setEnabled(on)
+        self.setCursor(Qt.CursorShape.PointingHandCursor if on
+                       else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, e):
+        if self._enabled and e.button() == Qt.MouseButton.LeftButton:
+            self._down = True
+            self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._down:
+            self._down = False
+            self.update()
+            if self.rect().contains(e.position().toPoint()) and self._enabled:
+                self.clicked.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        colors = {"blue": GEL_BLUE, "grey": GEL_GREY, "candy": GEL_CANDY}[self.kind]
+        if self.kind == "blue" and self._enabled:
+            import math
+            k = 0.5 + 0.5 * math.sin(self._phase * 2 * math.pi)
+            lift = int(4 + 13 * k)
+            colors = [QColor(c).lighter(100 + lift).name() for c in colors]
+        elif self._hover and self._enabled:
+            colors = [QColor(c).lighter(106).name() for c in colors]
+        # A weak sheen on blue keeps the white label readable; grey buttons
+        # have dark text, so they can take the full Aqua gloss.
+        paint_gel(p, rect, colors, pressed=self._down, enabled=self._enabled,
+                  gloss=0.42 if self.kind == "blue" else 1.0)
+
+        p.setFont(self.font())
+        if self._enabled:
+            if self.kind == "blue":
+                p.setPen(QColor(12, 54, 110, 90))
+                p.drawText(self.rect().adjusted(0, 1, 0, 1),
+                           Qt.AlignmentFlag.AlignCenter, self.text)
+                p.setPen(QColor("#FFFFFF"))
+            else:
+                p.setPen(QColor(255, 255, 255, 190))
+                p.drawText(self.rect().adjusted(0, 1, 0, 1),
+                           Qt.AlignmentFlag.AlignCenter, self.text)
+                p.setPen(INK)
+        else:
+            p.setPen(QColor("#A7B3C0"))
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+
+
+class TrafficLight(QWidget):
+    """One early-Aqua pill: rim, radial body, specular dot."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, colors, parent=None):
+        super().__init__(parent)
+        self.colors = colors
+        self._hover = False
+        self.setFixedSize(14, 14)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+
+    def paintEvent(self, _):
+        face, rim, hi = [QColor(c) for c in self.colors]
+        if self._hover:
+            face = face.lighter(112)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        body = QRectF(0.5, 0.5, 13, 13)
+        g = QRadialGradient(QPointF(6.0, 4.0), 12.0)
+        g.setColorAt(0.0, hi)
+        g.setColorAt(0.45, face)
+        g.setColorAt(1.0, rim)
+        p.setBrush(QBrush(g))
+        p.setPen(QPen(rim.darker(118), 1))
+        p.drawEllipse(body)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 205))
+        p.drawEllipse(QRectF(3.2, 2.0, 7.0, 4.2))
+
+
+class TitleBar(QWidget):
+    """Luna's gradient and centred bold caption, with Aqua's lights at left."""
+
+    close_clicked = pyqtSignal()
+    minimise_clicked = pyqtSignal()
+
+    def __init__(self, text, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.active = True
+        self.setFixedHeight(30)
+        self._drag = None
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 0, 10, 0)
+        row.setSpacing(7)
+        self.close_light = TrafficLight(LIGHT_RED, self)
+        self.min_light = TrafficLight(LIGHT_AMBER, self)
+        self.zoom_light = TrafficLight(LIGHT_GREEN, self)
+        self.close_light.clicked.connect(self.close_clicked)
+        self.min_light.clicked.connect(self.minimise_clicked)
+        for w in (self.close_light, self.min_light, self.zoom_light):
+            row.addWidget(w)
+        row.addStretch(1)
+        # A spacer the width of the lights keeps the caption truly centred.
+        spacer = QWidget(self)
+        spacer.setFixedWidth(3 * 14 + 2 * 7)
+        row.addWidget(spacer)
+
+    def set_active(self, on):
+        self.active = on
+        self.update()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag = e.globalPosition().toPoint() - \
+                self.window().frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(e.globalPosition().toPoint() - self._drag)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self.rect()
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(r).adjusted(0, 0, 0, 8), 7, 7)
+        p.setClipRect(r)
+        p.fillPath(path, QBrush(vgrad(r, LUNA_STOPS if self.active
+                                      else LUNA_INACTIVE)))
+        p.setPen(QPen(QColor(255, 255, 255, 120), 1))
+        p.drawLine(r.left() + 7, r.top() + 1, r.right() - 7, r.top() + 1)
+        p.setPen(QPen(QColor(0, 0, 0, 55), 1))
+        p.drawLine(r.left(), r.bottom(), r.right(), r.bottom())
+
+        p.setFont(title_font(10))
+        if self.active:
+            tw = p.fontMetrics().horizontalAdvance(self.text)
+            mid = r.center().x()
+            paint_sparkle(p, mid - tw / 2 - 13, r.center().y() - 3, 4.0,
+                          QColor(255, 255, 255, 210))
+            paint_sparkle(p, mid + tw / 2 + 13, r.center().y() + 2, 3.0,
+                          QColor(255, 255, 255, 165))
+        shadow = QColor(0, 24, 64, 150 if self.active else 70)
+        p.setPen(shadow)
+        p.drawText(r.adjusted(0, 2, 0, 2), Qt.AlignmentFlag.AlignCenter, self.text)
+        p.setPen(QColor("#FFFFFF") if self.active else QColor("#E4ECF6"))
+        p.drawText(r.adjusted(0, 1, 0, 1), Qt.AlignmentFlag.AlignCenter, self.text)
+
+
+class LunaGroup(QFrame):
+    """An XP Control Panel panel: captioned header, hairline border, white body."""
+
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.setObjectName("lunaGroup")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(1, 23, 1, 1)
+        outer.setSpacing(0)
+        self.body = QWidget(self)
+        self.body.setAutoFillBackground(False)
+        outer.addWidget(self.body)
+        self.inner = QVBoxLayout(self.body)
+        self.inner.setContentsMargins(11, 9, 11, 10)
+        self.inner.setSpacing(6)
+
+    def addWidget(self, w):
+        self.inner.addWidget(w)
+
+    def addLayout(self, lay):
+        self.inner.addLayout(lay)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 8, 8)
+        p.fillPath(path, QBrush(PANEL_WHITE))
+
+        head = QRectF(r.left(), r.top(), r.width(), 22)
+        hp = QPainterPath()
+        hp.addRoundedRect(head.adjusted(0, 0, 0, 8), 8, 8)
+        p.save()
+        p.setClipRect(head)
+        g = QLinearGradient(head.topLeft(), head.bottomLeft())
+        g.setColorAt(0.0, HEADER_TOP)
+        g.setColorAt(1.0, HEADER_BOT)
+        p.fillPath(hp, QBrush(g))
+        p.restore()
+
+        p.setPen(QPen(QColor("#B9CEE8"), 1))
+        p.drawLine(QPointF(r.left() + 1, head.bottom()),
+                   QPointF(r.right() - 1, head.bottom()))
+        p.save()
+        p.setClipPath(path)
+        p.setPen(QPen(QColor(255, 255, 255, 215), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        inner = QPainterPath()
+        inner.addRoundedRect(r.adjusted(1, 1, -1, -1), 7, 7)
+        p.drawPath(inner)
+        p.restore()
+        p.setPen(QPen(PANEL_BORDER, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        p.setFont(ui_font(8, bold=True))
+        p.setPen(QColor(255, 255, 255, 190))
+        p.drawText(QRectF(head).adjusted(11, 1, 0, 1),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.title)
+        p.setPen(HEADER_TEXT)
+        p.drawText(QRectF(head).adjusted(11, 0, 0, 0),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.title)
+
+
+class StatusLed(QWidget):
+    """A little gel bead. Grey when unknown, green when the camera answers."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.state = "unknown"
+        self.setFixedSize(15, 15)
+
+    def set_state(self, state):
+        self.state = state
+        self.update()
+
+    def paintEvent(self, _):
+        colors = {
+            "ok": ("#48E066", "#149C2C", "#D8FFDE"),
+            "bad": ("#FF6A5E", "#B92718", "#FFD6D0"),
+            "busy": ("#FFD24D", "#C98B00", "#FFF2C8"),
+            "unknown": ("#C6CFD9", "#8C98A6", "#F0F4F8"),
+        }[self.state]
+        face, rim, hi = [QColor(c) for c in colors]
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        g = QRadialGradient(QPointF(6.2, 4.4), 13.0)
+        g.setColorAt(0.0, hi)
+        g.setColorAt(0.5, face)
+        g.setColorAt(1.0, rim)
+        p.setBrush(QBrush(g))
+        p.setPen(QPen(rim.darker(115), 1))
+        p.drawEllipse(QRectF(0.5, 0.5, 14, 14))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 200))
+        p.drawEllipse(QRectF(3.6, 2.2, 7.4, 4.4))
+        if self.state == "ok":
+            paint_sparkle(p, 12.4, 2.6, 3.0, QColor(255, 255, 255, 235))
+
+
+class BarberPole(QWidget):
+    """Aqua's determinate/indeterminate bar: blue gel with marching stripes."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(16)
+        self._offset = 0
+        self._value = 0.0
+        self._running = False
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+
+    def start(self):
+        self._running = True
+        self._timer.start(40)
+        self.update()
+
+    def stop(self):
+        self._running = False
+        self._timer.stop()
+        self.update()
+
+    def set_value(self, frac):
+        self._value = max(0.0, min(1.0, frac))
+        self.update()
+
+    def _tick(self):
+        self._offset = (self._offset + 1) % 16
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        trough = QPainterPath()
+        trough.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        tg = QLinearGradient(r.topLeft(), r.bottomLeft())
+        tg.setColorAt(0.0, QColor("#D4DCE6"))
+        tg.setColorAt(0.5, QColor("#EFF3F8"))
+        tg.setColorAt(1.0, QColor("#FDFEFF"))
+        p.fillPath(trough, QBrush(tg))
+
+        width = r.width() * self._value if not self._running else r.width()
+        if width > 2:
+            fill = QRectF(r.left(), r.top(), width, r.height())
+            fp = QPainterPath()
+            fp.addRoundedRect(fill, fill.height() / 2, fill.height() / 2)
+            p.save()
+            p.setClipPath(fp)
+            fg = QLinearGradient(fill.topLeft(), fill.bottomLeft())
+            fg.setColorAt(0.0, QColor("#9FD0FF"))
+            fg.setColorAt(0.48, QColor("#3E8FE0"))
+            fg.setColorAt(0.52, QColor("#2A79CF"))
+            fg.setColorAt(1.0, QColor("#5AA0E6"))
+            p.fillRect(fill, QBrush(fg))
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(255, 255, 255, 62))
+            step = 16
+            x = fill.left() - 32 + self._offset
+            while x < fill.right() + 32:
+                poly = QPolygonF([QPointF(x, fill.bottom()),
+                                  QPointF(x + step / 2, fill.bottom()),
+                                  QPointF(x + step / 2 + 9, fill.top()),
+                                  QPointF(x + 9, fill.top())])
+                p.drawPolygon(poly)
+                x += step
+            gloss = QRectF(fill.adjusted(0, 1, 0, -fill.height() * 0.55))
+            gg = QLinearGradient(gloss.topLeft(), gloss.bottomLeft())
+            gg.setColorAt(0.0, QColor(255, 255, 255, 190))
+            gg.setColorAt(1.0, QColor(255, 255, 255, 20))
+            p.fillRect(gloss, QBrush(gg))
+            p.restore()
+
+        p.setPen(QPen(QColor("#8FA8C8"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(trough)
+
+
+class CameraGlyph(QWidget):
+    """A small painted camera. Chunky and glossy, the way 2001 liked things."""
+
+    def __init__(self, size=34, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(size, size)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        s = self.width()
+        k = s / 34.0
+        body = QRectF(2 * k, 9 * k, 30 * k, 21 * k)
+        path = QPainterPath()
+        path.addRoundedRect(body, 5 * k, 5 * k)
+        hump = QPainterPath()
+        hump.addRoundedRect(QRectF(8 * k, 5 * k, 12 * k, 7 * k), 2.5 * k, 2.5 * k)
+        path = path.united(hump)
+        g = QLinearGradient(body.topLeft(), body.bottomLeft())
+        g.setColorAt(0.0, QColor("#7FB4E8"))
+        g.setColorAt(0.5, QColor("#3E7FC6"))
+        g.setColorAt(0.52, QColor("#2E6AB0"))
+        g.setColorAt(1.0, QColor("#5C97D8"))
+        p.fillPath(path, QBrush(g))
+        p.setPen(QPen(QColor("#1D4C82"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        lens = QRectF(11 * k, 14 * k, 12 * k, 12 * k)
+        lg = QRadialGradient(QPointF(lens.center().x() - 2 * k,
+                                     lens.center().y() - 3 * k), 13 * k)
+        lg.setColorAt(0.0, QColor("#E8F6FF"))
+        lg.setColorAt(0.45, QColor("#3A7FC0"))
+        lg.setColorAt(1.0, QColor("#12325C"))
+        p.setBrush(QBrush(lg))
+        p.setPen(QPen(QColor("#12325C"), 1))
+        p.drawEllipse(lens)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 210))
+        p.drawEllipse(QRectF(13.5 * k, 15.5 * k, 4.5 * k, 3 * k))
+        # flash bead
+        p.setBrush(QColor("#FFD86A"))
+        p.setPen(QPen(QColor("#C79A16"), 1))
+        p.drawEllipse(QRectF(25 * k, 12.5 * k, 4.5 * k, 4.5 * k))
+
+
+class PhotoRow(QWidget):
+    """One directory entry, with its thumbnail once it has been saved."""
+
+    def __init__(self, entry, outdir, parent=None):
+        super().__init__(parent)
+        self.entry = entry
+        self.outdir = outdir
+        self.state = "pending"
+        self.setFixedHeight(42)
+
+    def set_state(self, state):
+        self.state = state
+        self.update()
+
+    def _thumb(self):
+        png = os.path.join(self.outdir, self.entry.basename + ".png")
+        if os.path.exists(png):
+            pm = QPixmap(png)
+            if not pm.isNull():
+                return pm.scaled(44, 33, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+        return None
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -1.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 5, 5)
+        tint = {"pending": QColor("#FFFFFF"), "busy": QColor("#FFF8E2"),
+                "done": QColor("#F2FBF3"), "failed": QColor("#FDF1EF"),
+                "partial": QColor("#FFFAEC")}[self.state]
+        p.fillPath(path, QBrush(tint))
+        p.setPen(QPen(QColor("#D5DFEB"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+        thumb = self._thumb()
+        frame = QRectF(6, 5, 44, 31)
+        if thumb is not None:
+            p.setPen(QPen(QColor("#9BAEC4"), 1))
+            p.setBrush(QColor("#FFFFFF"))
+            p.drawRect(frame)
+            x = frame.left() + (frame.width() - thumb.width()) / 2
+            y = frame.top() + (frame.height() - thumb.height()) / 2
+            p.drawPixmap(QPoint(int(x), int(y)), thumb)
+        else:
+            p.setPen(QPen(QColor("#C3D0DF"), 1, Qt.PenStyle.DashLine))
+            p.setBrush(QColor("#F6F9FC"))
+            p.drawRect(frame)
+
+        p.setFont(ui_font(8, bold=True))
+        p.setPen(INK)
+        p.drawText(QRectF(58, 5, 150, 16),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.entry.basename)
+        p.setFont(ui_font(8))
+        p.setPen(INK_SOFT)
+        kind = "movie clip" if self.entry.is_movie else "still"
+        p.drawText(QRectF(58, 20, 200, 15),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   "%s · %s KB" % (kind, "{:,}".format(self.entry.data_bytes // 1024)))
+
+        badge = {"done": ("saved", OK_GREEN), "failed": ("failed", BAD_RED),
+                 "busy": ("reading…", QColor("#B4801A")),
+                 "partial": ("partial", QColor("#B4801A")),
+                 "pending": ("", INK_SOFT)}[self.state]
+        if badge[0]:
+            p.setFont(ui_font(8, bold=True))
+            p.setPen(badge[1])
+            p.drawText(QRectF(r.right() - 86, 5, 80, 32),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                       badge[0])
+
+
+class Job(QThread):
+    """Runs one blinky operation off the UI thread."""
+
+    line = pyqtSignal(str, str)          # level, text
+    step = pyqtSignal(float, str)        # fraction, caption
+    item = pyqtSignal(int, str)          # image index, state
+    ok = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self.fn = fn
+
+    def run(self):
+        log = GuiLog(self.line.emit)
+        try:
+            self.ok.emit(self.fn(self, log))
+        except blinky.CameraError as exc:
+            self.failed.emit(str(exc))
+        except Exception as exc:                       # never kill the UI
+            self.failed.emit("%s: %s" % (type(exc).__name__, exc))
+
+
+class GuiLog(blinky.Log):
+    """blinky's logger, rerouted into the Activity panel."""
+
+    def __init__(self, sink):
+        super().__init__(verbose=False, quiet=True)
+        self.sink = sink
+
+    def _emit(self, msg, stream=None):
+        self.sink("info", str(msg))
+
+    def out(self, msg=""):
+        self._record("OUT", msg)
+        if str(msg).strip():
+            self.sink("out", str(msg))
+
+    def warn(self, msg):
+        self._record("WARN", msg)
+        self.sink("warn", str(msg))
+
+    def error(self, msg):
+        self._record("ERROR", msg)
+        self.sink("error", str(msg))
+
+
+class ActivityLog(QScrollArea):
+    """The Activity panel. Sunken, mono-ish, with coloured levels."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.inner = QLabel()
+        self.inner.setWordWrap(True)
+        self.inner.setTextFormat(Qt.TextFormat.RichText)
+        self.inner.setAlignment(Qt.AlignmentFlag.AlignTop |
+                                Qt.AlignmentFlag.AlignLeft)
+        self.inner.setFont(ui_font(8))
+        self.inner.setContentsMargins(7, 5, 7, 5)
+        self.setWidget(self.inner)
+        self.setStyleSheet(
+            "QScrollArea { background: #FFFFFF; border: 1px solid #A8BACF;"
+            " border-radius: 4px; }"
+            "QLabel { background: #FFFFFF; }"
+            "QScrollBar:vertical { background: #EDF1F7; width: 12px;"
+            " border: none; margin: 0; }"
+            "QScrollBar::handle:vertical { background: #8FB6DE; min-height: 22px;"
+            " border-radius: 6px; border: 1px solid #5E8CBD; }"
+            "QScrollBar::add-line, QScrollBar::sub-line { height: 0; }")
+        self.lines = []
+
+    def append(self, level, text):
+        colour = {"error": "#B4281B", "warn": "#9A6A00",
+                  "out": "#20303F", "info": "#5B6C7D"}.get(level, "#5B6C7D")
+        weight = "bold" if level in ("error", "warn") else "normal"
+        safe = (text.replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace("  ", "&nbsp;&nbsp;"))
+        self.lines.append(
+            '<div style="color:%s;font-weight:%s;margin:0 0 2px 0;">%s</div>'
+            % (colour, weight, safe))
+        del self.lines[:-400]
+        self.inner.setText("".join(self.lines))
+        bar = self.verticalScrollBar()
+        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
+
+    def clear(self):
+        self.lines = []
+        self.inner.setText("")
+
+
+class BlinkyWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Blinky")
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMinimumSize(600, 676)
+        self.resize(600, 716)
+
+        self.outdir = blinky.DEFAULT_OUTDIR
+        self.entries = []
+        self.rows = []
+        self.job = None
+
+        shell = QVBoxLayout(self)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        self.titlebar = TitleBar("Blinky", self)
+        self.titlebar.close_clicked.connect(self.close)
+        self.titlebar.minimise_clicked.connect(self.showMinimized)
+        shell.addWidget(self.titlebar)
+
+        body = QWidget(self)
+        shell.addWidget(body, 1)
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(15, 14, 15, 14)
+        lay.setSpacing(13)
+
+        # -- Camera -------------------------------------------------------
+        cam = LunaGroup("Camera", self)
+        head = QHBoxLayout()
+        head.setSpacing(11)
+        head.addWidget(CameraGlyph(34, self))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        idline = QHBoxLayout()
+        idline.setSpacing(7)
+        self.led = StatusLed(self)
+        idline.addWidget(self.led)
+        self.status = QLabel("Looking for the camera…")
+        self.status.setFont(ui_font(9, bold=True))
+        self.status.setStyleSheet("color:#20303F;")
+        idline.addWidget(self.status)
+        idline.addStretch(1)
+        col.addLayout(idline)
+        self.detail = QLabel("—")
+        self.detail.setFont(ui_font(8))
+        self.detail.setStyleSheet("color:#5B6C7D;")
+        col.addWidget(self.detail)
+        head.addLayout(col, 1)
+        btns = QHBoxLayout()
+        btns.setSpacing(7)
+        self.btn_check = GelButton("Check", "candy", self)
+        self.btn_refresh = GelButton("Refresh", "grey", self)
+        self.btn_check.clicked.connect(self.run_doctor)
+        self.btn_refresh.clicked.connect(self.refresh)
+        btns.addWidget(self.btn_check)
+        btns.addWidget(self.btn_refresh)
+        head.addLayout(btns)
+        cam.addLayout(head)
+        lay.addWidget(cam)
+
+        # -- Photos -------------------------------------------------------
+        shots = LunaGroup("Photos on the camera", self)
+        self.scroll = QScrollArea(self)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setStyleSheet(
+            "QScrollArea { background: transparent; border: none; }"
+            "QScrollBar:vertical { background: #EDF1F7; width: 12px; border: none; }"
+            "QScrollBar::handle:vertical { background: #8FB6DE; min-height: 22px;"
+            " border-radius: 6px; border: 1px solid #5E8CBD; }"
+            "QScrollBar::add-line, QScrollBar::sub-line { height: 0; }")
+        holder = QWidget()
+        holder.setStyleSheet("background: transparent;")
+        self.rowbox = QVBoxLayout(holder)
+        self.rowbox.setContentsMargins(0, 0, 4, 0)
+        self.rowbox.setSpacing(4)
+        self.empty = QLabel("Plug the camera in and press Refresh.")
+        self.empty.setFont(ui_font(8))
+        self.empty.setStyleSheet("color:#7C8B9B;")
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rowbox.addWidget(self.empty)
+        self.rowbox.addStretch(1)
+        self.scroll.setWidget(holder)
+        self.scroll.setMinimumHeight(190)
+        shots.addWidget(self.scroll)
+        lay.addWidget(shots, 1)
+
+        # -- Activity -----------------------------------------------------
+        act = LunaGroup("Activity", self)
+        self.log = ActivityLog(self)
+        self.log.setMinimumHeight(104)
+        act.addWidget(self.log)
+        lay.addWidget(act)
+
+        # -- Save-to + action row ------------------------------------------
+        dest = QHBoxLayout()
+        dest.setSpacing(8)
+        tag = QLabel("Save to")
+        tag.setFont(ui_font(8, bold=True))
+        tag.setStyleSheet("color:#20303F;")
+        dest.addWidget(tag)
+        self.destlabel = QLabel(self._pretty(self.outdir))
+        self.destlabel.setFont(ui_font(8))
+        self.destlabel.setStyleSheet(
+            "color:#12447E; background:#FFFFFF; border:1px solid #A8BACF;"
+            " border-radius:4px; padding:3px 8px;")
+        dest.addWidget(self.destlabel, 1)
+        self.btn_folder = GelButton("Change…", "grey", self, width=84)
+        self.btn_folder.clicked.connect(self.pick_folder)
+        dest.addWidget(self.btn_folder)
+        lay.addLayout(dest)
+
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        self.bar = BarberPole(self)
+        foot.addWidget(self.bar, 1)
+        self.btn_download = GelButton("Download All", "blue", self, width=124)
+        self.btn_download.clicked.connect(self.download)
+        foot.addWidget(self.btn_download)
+        lay.addLayout(foot)
+
+        self.set_busy(False)
+        QTimer.singleShot(250, self.refresh)
+
+    # -- chrome -----------------------------------------------------------
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+        p.save()
+        p.setClipPath(path)
+        paint_pinstripes(p, self.rect())
+        sheen = QRectF(r.left(), r.top(), r.width(), 96)
+        sg = QLinearGradient(sheen.topLeft(), sheen.bottomLeft())
+        sg.setColorAt(0.0, QColor(255, 255, 255, 120))
+        sg.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(sheen, QBrush(sg))
+        p.restore()
+        p.setPen(QPen(QColor("#4C6A8E"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+    def _pretty(self, path):
+        home = os.path.expanduser("~")
+        return path.replace(home, "~", 1) if path.startswith(home) else path
+
+    # -- plumbing ---------------------------------------------------------
+
+    def set_busy(self, busy, caption=""):
+        for b in (self.btn_check, self.btn_refresh, self.btn_download,
+                  self.btn_folder):
+            b.setEnabled(not busy)
+        if busy:
+            self.bar.start()
+            self.led.set_state("busy")
+            if caption:
+                self.status.setText(caption)
+        else:
+            self.bar.stop()
+
+    def start(self, fn, on_ok, caption):
+        if self.job is not None and self.job.isRunning():
+            return
+        self.set_busy(True, caption)
+        job = Job(fn, self)
+        job.line.connect(self.log.append)
+        job.step.connect(self._on_step)
+        job.item.connect(self._on_item)
+        job.ok.connect(on_ok)
+        job.failed.connect(self._on_failed)
+        job.finished.connect(lambda: self.set_busy(False))
+        self.job = job
+        job.start()
+
+    def _on_step(self, frac, caption):
+        self.bar.stop()
+        self.bar.set_value(frac)
+        if caption:
+            self.status.setText(caption)
+
+    def _on_item(self, index, state):
+        if 0 <= index < len(self.rows):
+            self.rows[index].set_state(state)
+
+    def _on_failed(self, message):
+        self.led.set_state("bad")
+        self.status.setText("Something went wrong")
+        self.detail.setText(message.splitlines()[0][:96])
+        self.log.append("error", message)
+
+    # -- operations -------------------------------------------------------
+
+    def refresh(self):
+        def work(job, log):
+            cam = blinky.Blink2(log)
+            cam.open()
+            try:
+                fw = cam.firmware_id()
+                n = cam.get_numpics()
+                entries = []
+                if n:
+                    entries, _, _ = cam.get_directory(n)
+                return fw, n, entries
+            finally:
+                cam.close()
+
+        self.log.append("info", "Looking for the camera…")
+        self.start(work, self._loaded, "Reading the camera…")
+
+    def _loaded(self, result):
+        fw, n, entries = result
+        self.entries = entries
+        self.led.set_state("ok")
+        self.status.setText("SiPix StyleCam Blink II")
+        total = sum(e.data_bytes for e in entries)
+        self.detail.setText(
+            "%d photo%s · %s KB · firmware %s"
+            % (n, "" if n == 1 else "s", "{:,}".format(total // 1024),
+               fw.hex(" ")))
+        self._rebuild_rows()
+        self.log.append("out", "Found %d photo%s on the camera."
+                        % (n, "" if n == 1 else "s"))
+
+    def _rebuild_rows(self):
+        while self.rowbox.count():
+            item = self.rowbox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.rows = []
+        if not self.entries:
+            msg = QLabel("The camera is empty.")
+            msg.setFont(ui_font(8))
+            msg.setStyleSheet("color:#7C8B9B;")
+            msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.rowbox.addWidget(msg)
+        for e in self.entries:
+            row = PhotoRow(e, self.outdir, self)
+            png = os.path.join(self.outdir, e.basename + ".png")
+            avi = os.path.join(self.outdir, e.basename + ".avi")
+            if os.path.exists(png) or os.path.exists(avi):
+                row.set_state("done")
+            self.rows.append(row)
+            self.rowbox.addWidget(row)
+        self.rowbox.addStretch(1)
+
+    def run_doctor(self):
+        def work(job, log):
+            results, cam = blinky.run_checks(log)
+            if cam is not None:
+                cam.close()
+            for i, r in enumerate(results):
+                job.step.emit((i + 1) / 5.0, "")
+            return results
+
+        self.log.clear()
+        self.log.append("info", "Running the five checks…")
+        self.start(work, self._doctored, "Checking…")
+
+    def _doctored(self, results):
+        for r in results:
+            self.log.append("out" if r.ok else "error",
+                            "%s  %d. %s" % ("[PASS]" if r.ok else "[FAIL]",
+                                            r.number, r.title))
+            for d in r.detail[:4]:
+                self.log.append("info", "      " + d)
+        bad = [r for r in results if not r.ok]
+        if bad:
+            self.led.set_state("bad")
+            self.status.setText("Check %d failed" % bad[0].number)
+            self.detail.setText(bad[0].title)
+            if bad[0].fix:
+                self.log.append("warn", "Likely fix:")
+                for line in blinky._wrap(bad[0].fix)[:14]:
+                    self.log.append("info", "   " + line)
+        else:
+            self.led.set_state("ok")
+            self.status.setText("All five checks passed")
+            self.detail.setText("The camera is ready to talk to.")
+
+    def pick_folder(self):
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Save photos to", self.outdir)
+        if chosen:
+            self.outdir = chosen
+            self.destlabel.setText(self._pretty(chosen))
+            self._rebuild_rows()
+
+    def download(self):
+        if not self.entries:
+            self.log.append("warn", "Nothing to download. Press Refresh first.")
+            return
+        entries, outdir = list(self.entries), self.outdir
+
+        def work(job, log):
+            os.makedirs(outdir, exist_ok=True)
+            cam = blinky.Blink2(log)
+            cam.open()
+            saved = failed = partial = 0
+            try:
+                for i, e in enumerate(entries):
+                    job.item.emit(i, "busy")
+                    job.step.emit(i / len(entries),
+                                  "Reading %s…" % e.basename)
+                    try:
+                        data = cam.read_image_with_retries(e)
+                    except blinky.CameraError as exc:
+                        log.error("%s: %s" % (e.basename, exc))
+                        job.item.emit(i, "failed")
+                        failed += 1
+                        continue
+                    if e.is_movie:
+                        # A clip needs no decoding, so the .avi is the raw save.
+                        blinky.write_file_atomically(
+                            os.path.join(outdir, e.basename + ".avi"), data)
+                        job.item.emit(i, "done")
+                        saved += 1
+                        continue
+                    raw = os.path.join(outdir, e.basename + ".raw")
+                    blinky.write_file_atomically(raw, data)
+                    try:
+                        w, h, raster, part = blinky.decode_still(data, log)
+                        blinky.write_png(
+                            os.path.join(outdir, e.basename + ".png"),
+                            w, h, raster)
+                        job.item.emit(i, "partial" if part else "done")
+                        partial += 1 if part else 0
+                        saved += 1
+                    except blinky.CameraError as exc:
+                        log.error("%s: decode failed: %s" % (e.basename, exc))
+                        log.info("the raw data is kept at %s" % raw)
+                        job.item.emit(i, "failed")
+                        failed += 1
+                job.step.emit(1.0, "")
+                return saved, failed, partial
+            finally:
+                cam.close()
+
+        self.log.append("info", "Downloading %d photo%s to %s"
+                        % (len(entries), "" if len(entries) == 1 else "s",
+                           self._pretty(outdir)))
+        self.start(work, self._downloaded, "Downloading…")
+
+    def _downloaded(self, result):
+        saved, failed, partial = result
+        self.led.set_state("ok" if not failed else "bad")
+        self.status.setText("Saved %d photo%s" % (saved, "" if saved == 1 else "s"))
+        bits = ["%d saved" % saved]
+        if partial:
+            bits.append("%d partial" % partial)
+        if failed:
+            bits.append("%d failed" % failed)
+        self.detail.setText(" · ".join(bits) + " · " +
+                            self._pretty(self.outdir))
+        self.log.append("out", "Done: " + ", ".join(bits) + ".")
+        self._rebuild_rows()
+        for i, row in enumerate(self.rows):
+            png = os.path.join(self.outdir, row.entry.basename + ".png")
+            avi = os.path.join(self.outdir, row.entry.basename + ".avi")
+            if os.path.exists(png) or os.path.exists(avi):
+                row.set_state("done")
+
+
+def main(argv=None):
+    app = QApplication(argv if argv is not None else sys.argv)
+    app.setApplicationName("Blinky")
+    app.setApplicationDisplayName("Blinky")
+    app.setFont(ui_font(8))
+    win = BlinkyWindow()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+.TH BLINKY-GUI 1 "2026-09-18" "blinky 1.0" "User Commands"
+.SH NAME
+blinky\-gui \- window for the SiPix StyleCam Blink II camera
+.SH SYNOPSIS
+.B blinky\-gui
+.SH DESCRIPTION
+A front end for
+.BR blinky (1).
+It finds the camera, lists what is on it, downloads everything with a progress
+bar and shows the five diagnostic checks, all without the terminal.
+.PP
+Photos already saved in the output folder appear with thumbnails. As with the
+command line tool, raw camera bytes reach the disk before anything tries to
+decode them.
+.PP
+Requires PyQt6. On Debian and Ubuntu that is the
+.B python3\-pyqt6
+package.
+.SH SEE ALSO
+.BR blinky (1)
