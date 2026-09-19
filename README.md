@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.3-1_all.deb
+sudo apt install ./packaging/blinky_1.4-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -136,10 +136,11 @@ main folder holds only things you would want to look at:
 ~/Pictures/blink-pics/
     image0000.png
     image0001.png
-    image0002.avi        a clip, saved as-is (see the note below)
+    image0002.avi        a clip, rebuilt as a playable MJPEG AVI
     raw/
         image0000.raw
         image0001.raw
+        image0002.raw    the clip's Motion JPEG stream
 ```
 
 `--no-raw-subfolder` (or unticking the box in the window) keeps everything in
@@ -153,24 +154,36 @@ camera, written and fsynced *before* anything tries to interpret it, and
 data is still on disk and `blinky decode` can retry it without another transfer
 over a flaky link.
 
-Video clips need no decoding, so the saved file **is** the untouched raw data;
-there is no separate `.raw` for a clip.
+Clips are handled the same way: the camera's bytes go to `raw/`, and a
+playable `.avi` is built beside the pictures.
 
-#### A caveat about clips
+### Video clips
 
-Nothing here has been tested against a real video, because no clip has ever
-been seen on this camera. The whole notion comes from one byte: the directory
-table has a flag per entry, and `blink2.c` names anything with that flag set
-`.avi` — without ever looking at the data. libgphoto2's own protocol notes on
-video are about *live streaming* over isochronous transfers, and are hedged
-throughout ("I suspect", "Unclear"), so even the author was guessing.
+libgphoto2 names anything with the directory's movie flag set `.avi` without
+ever looking at the data, and its protocol notes on video describe *live
+streaming* and are hedged throughout ("I suspect", "Unclear"). So the stored
+format was not actually documented anywhere. Measured from real clips off
+this camera:
 
-blinky therefore checks rather than assumes. If the bytes begin `RIFF....AVI `
-it is an AVI and gets that extension; otherwise the file is saved as `.bin`
-with a warning, because putting a container's extension on bytes that are not
-in that container is just a lie that fails later. Either way the exact bytes
-are preserved, which is the part that matters — the format can be worked out
-afterwards from a real sample.
+- A clip is **Motion JPEG**: complete JFIF frames laid end to end, each padded
+  to an 8-byte boundary. It is not an AVI, and naming it `.avi` as it comes
+  off the camera produces a file nothing will play.
+- Frames are **320x120**, exactly half a still in each axis, and carry the
+  **same two-field interleave** — the discontinuity sits at `x mod 16 == 7`
+  and a phase sweep bottoms out at 8, just as it does for stills. So each
+  frame de-interleaves to **320x240**.
+
+blinky splits the stream, de-interleaves every frame, and writes a real MJPEG
+AVI with a proper `hdrl`/`movi`/`idx1` structure — no ffmpeg, no dependencies.
+`file` identifies the result as *"AVI, 320 x 240, 10.00 fps, Motion JPEG"*.
+
+Two honest caveats. The camera records **no timing information**, so the frame
+rate is a choice rather than a measurement; `--fps` changes it, and 10 is a
+guess that looks about right. And rebuilding the container means re-encoding
+each frame to JPEG, which is a second lossy pass — the camera's untouched
+bytes are kept in `raw/` for that reason, and `blinky decode` rebuilds the
+video from them at any time. If a camera ever hands over a genuine RIFF/AVI,
+it is copied through untouched instead.
 
 ### Deleting
 

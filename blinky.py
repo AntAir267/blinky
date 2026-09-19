@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.3"
+__version__ = "1.4"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -68,6 +68,141 @@ RAW_SUBDIR = "raw"
 # driver never inspects the data, and its own protocol notes about video are
 # hedged ("I suspect", "Unclear"). So check the bytes before claiming a format.
 MOVIE_EXTS = (".avi", ".bin")
+
+
+DEFAULT_CLIP_FPS = 10
+
+
+def split_clip_frames(data):
+    """A clip is Motion JPEG: whole JPEG frames laid end to end.
+
+    Measured on this camera: each frame is a complete JFIF image, 320x120,
+    carrying the same two-field interleave as a still, and frames are padded
+    to an 8-byte boundary between them.
+    """
+    frames = []
+    i = 0
+    while True:
+        soi = data.find(b"\xff\xd8", i)
+        if soi < 0:
+            break
+        eoi = data.find(b"\xff\xd9", soi + 2)
+        if eoi < 0:
+            # A truncated trailing frame is still worth keeping.
+            frames.append(data[soi:])
+            break
+        frames.append(data[soi:eoi + 2])
+        i = eoi + 2
+    return frames
+
+
+def _avi_chunk(fourcc, payload):
+    pad = b"\x00" if len(payload) & 1 else b""
+    return fourcc + len(payload).to_bytes(4, "little") + payload + pad
+
+
+def write_mjpeg_avi(path, jpeg_frames, width, height, fps=DEFAULT_CLIP_FPS):
+    """Write a minimal but valid MJPEG AVI. No dependencies, no ffmpeg."""
+    import struct
+    if not jpeg_frames:
+        raise CameraError("no frames to write")
+    biggest = max(len(f) for f in jpeg_frames)
+    rate = max(1, int(round(fps)))
+
+    avih = struct.pack("<IIIIIIIIII16x",
+                       int(1000000 / rate),   # microseconds per frame
+                       biggest * rate,        # max bytes per second
+                       0,                     # padding granularity
+                       0x10,                  # AVIF_HASINDEX
+                       len(jpeg_frames),      # total frames
+                       0,                     # initial frames
+                       1,                     # streams
+                       biggest,               # suggested buffer
+                       width, height)
+    # fccType, fccHandler, dwFlags, wPriority, wLanguage, dwInitialFrames,
+    # dwScale, dwRate, dwStart, dwLength, dwSuggestedBufferSize, dwQuality,
+    # dwSampleSize, rcFrame -- 56 bytes.
+    strh = struct.pack("<4s4sIHHIIIIIIiIhhhh",
+                       b"vids", b"MJPG", 0, 0, 0, 0,
+                       1, rate,               # scale, rate -> fps
+                       0, len(jpeg_frames),
+                       biggest, -1, 0,
+                       0, 0, width, height)
+    strf = struct.pack("<IiiHH4sIiiII", 40, width, height, 1, 24,
+                       b"MJPG", width * height * 3, 0, 0, 0, 0)
+    hdrl = _avi_chunk(b"LIST", b"hdrl" + _avi_chunk(b"avih", avih)
+                      + _avi_chunk(b"LIST", b"strl" + _avi_chunk(b"strh", strh)
+                                   + _avi_chunk(b"strf", strf)))
+
+    movi_body = bytearray(b"movi")
+    index = bytearray()
+    for frame in jpeg_frames:
+        # Index offsets are measured from the start of the 'movi' payload.
+        index += (b"00dc" + (0x10).to_bytes(4, "little")
+                  + len(movi_body).to_bytes(4, "little")
+                  + len(frame).to_bytes(4, "little"))
+        movi_body += _avi_chunk(b"00dc", frame)
+    movi = _avi_chunk(b"LIST", bytes(movi_body))
+    idx1 = _avi_chunk(b"idx1", bytes(index))
+
+    body = b"AVI " + hdrl + movi + idx1
+    write_file_atomically(path, b"RIFF"
+                          + len(body).to_bytes(4, "little") + body)
+    return len(jpeg_frames)
+
+
+def decode_clip(data, log, quality=95):
+    """Clip bytes -> (width, height, de-interleaved JPEG frames, partials).
+
+    Each frame goes through the same de-interleave as a still, then back to
+    JPEG for the container. That is a re-encode of already-lossy data, which
+    is why the camera's untouched bytes are kept alongside.
+    """
+    import io
+    Image = _import_pil()
+    raw_frames = split_clip_frames(data)
+    if not raw_frames:
+        raise CameraError("no JPEG frames found in the clip data")
+    out, partials, size = [], 0, None
+    for n, frame in enumerate(raw_frames):
+        try:
+            width, height, raster, partial = decode_still(frame, log)
+        except CameraError as exc:
+            log.warn("clip frame %d could not be decoded (%s); skipping it"
+                     % (n, exc))
+            continue
+        partials += 1 if partial else 0
+        if size is None:
+            size = (width, height)
+        elif (width, height) != size:
+            log.warn("clip frame %d is %dx%d, not %dx%d; skipping it"
+                     % (n, width, height, size[0], size[1]))
+            continue
+        buf = io.BytesIO()
+        Image.frombytes("RGB", (width, height), raster).save(
+            buf, "JPEG", quality=quality, subsampling=0)
+        out.append(buf.getvalue())
+    if not out:
+        raise CameraError("none of the clip's %d frame(s) could be decoded"
+                          % len(raw_frames))
+    return size[0], size[1], out, partials
+
+
+def build_clip(data, avi_path, log, fps=DEFAULT_CLIP_FPS, quality=95):
+    """Turn a clip's raw bytes into a playable AVI. Returns (frames, w, h)."""
+    _, is_avi = movie_extension(data)
+    if is_avi:
+        # Already a container: pass it through untouched rather than
+        # re-encoding something that needs no work.
+        log.info("    the camera supplied a complete AVI; copying it as-is")
+        write_file_atomically(avi_path, data)
+        return 0, 0, 0
+    width, height, frames, partials = decode_clip(data, log, quality)
+    if partials:
+        log.warn("%d clip frame(s) were damaged and decoded only partially"
+                 % partials)
+    write_mjpeg_avi(avi_path, frames, width, height, fps)
+    return len(frames), width, height
 
 
 def movie_extension(data):
@@ -1931,11 +2066,10 @@ def cmd_download(args, log, state):
                     else (".jpg",) if args.format == "jpeg"
                     else (".png", ".jpg"))
             if entry.is_movie:
-                # A clip needs no decoding, so the saved file is both the raw
-                # data and the thing you play: it stays with the pictures.
-                # The extension is settled after the bytes arrive.
-                raw_path = os.path.join(outdir, stem + ".avi")
-                targets = [os.path.join(outdir, stem + e) for e in MOVIE_EXTS]
+                # A clip is Motion JPEG, so like a still it has raw bytes to
+                # keep and a playable file to build from them.
+                raw_path = os.path.join(rawdir, stem + ".raw")
+                targets = [raw_path, os.path.join(outdir, stem + ".avi")]
             else:
                 raw_path = os.path.join(rawdir, stem + ".raw")
                 targets = [raw_path] + [os.path.join(outdir, stem + e)
@@ -1982,18 +2116,6 @@ def cmd_download(args, log, state):
                      % (len(data), elapsed,
                         len(data) / 1024.0 / elapsed if elapsed else 0.0))
 
-            if entry.is_movie:
-                ext, known = movie_extension(data)
-                raw_path = os.path.splitext(raw_path)[0] + ext
-                if not known:
-                    log.warn("%s is flagged as a clip but its data is not an "
-                             "AVI container; saving the bytes as %s rather "
-                             "than guessing at a format"
-                             % (entry.basename, os.path.basename(raw_path)))
-                    log.info("    please report this file: the clip format "
-                             "has never been seen, so blinky cannot convert it "
-                             "yet")
-
             # Raw bytes hit the disk before anything tries to interpret them.
             os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
             write_file_atomically(raw_path, data)
@@ -2002,9 +2124,20 @@ def cmd_download(args, log, state):
             verified[i] = (raw_path, len(data),
                            hashlib.sha256(data).hexdigest())
 
-            if entry.is_movie:
-                continue
             stem = os.path.splitext(os.path.basename(raw_path))[0]
+            if entry.is_movie:
+                avi_path = os.path.join(outdir, stem + ".avi")
+                try:
+                    n, w, h = build_clip(data, avi_path, log, args.fps)
+                    log.info("    %d frame%s at %dx%d -> %s"
+                             % (n, "" if n == 1 else "s", w, h, avi_path))
+                    saved.append(avi_path)
+                except CameraError as exc:
+                    log.error("%s: could not build a video: %s"
+                              % (entry.basename, exc))
+                    log.info("    the camera's bytes are kept at %s" % raw_path)
+                    failures.append((entry.basename, "clip: %s" % exc))
+                continue
             try:
                 width, height, raster, partial = decode_still(data, log)
                 for path in write_still(outdir, stem, width, height, raster,
@@ -2341,6 +2474,19 @@ def cmd_decode(args, log, state):
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
+            # A clip's raw file holds many frames; decoding only the first
+            # would quietly turn a video into a photograph.
+            if len(split_clip_frames(data)) > 1:
+                avi_path = os.path.join(target_dir, base + ".avi")
+                if os.path.exists(avi_path) and not args.force:
+                    log.out("%s: skipped, %s already exists" % (path, avi_path))
+                    skipped += 1
+                    continue
+                n, w, h = build_clip(data, avi_path, log, args.fps)
+                log.out("%s -> %s  (%d frames at %dx%d)"
+                        % (path, avi_path, n, w, h))
+                done += 1
+                continue
             width, height, raster, partial = decode_still(data, log)
             written = write_still(target_dir, base, width, height, raster,
                                   args.format, args.jpeg_quality)
@@ -2512,6 +2658,12 @@ def add_format_options(parser):
                              "re-encodes them a second time")
     parser.add_argument("--jpeg-quality", type=int, default=92, metavar="N",
                         help="JPEG quality 1-100 (default 92)")
+    parser.add_argument("--fps", type=float, default=DEFAULT_CLIP_FPS,
+                        metavar="N",
+                        help="frame rate to record in a clip's AVI (default "
+                             "%g). The camera stores no timing information, "
+                             "so this is a choice, not a measurement"
+                             % DEFAULT_CLIP_FPS)
     return parser
 
 
@@ -2639,6 +2791,8 @@ def main(argv=None):
         parser.error("--timeout and --chunk must be positive, --retries >= 0")
     if getattr(args, "jpeg_quality", 92) not in range(1, 101):
         parser.error("--jpeg-quality must be between 1 and 100")
+    if not 0 < getattr(args, "fps", 1) <= 120:
+        parser.error("--fps must be above 0 and at most 120")
     if getattr(args, "last", None) is not None and args.last < 1:
         parser.error("--last must be 1 or more")
 

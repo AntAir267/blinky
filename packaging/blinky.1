@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.3" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.4" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -105,6 +105,10 @@ JPEG, so \fBpng\fR is lossless from the decoded pixels while \fBjpeg\fR puts
 the image through a second lossy pass. The .raw file blinky keeps alongside is
 the camera's original JPEG bitstream.
 .TP
+.BI \-\-fps " N"
+Frame rate recorded in a clip's AVI, default 10. The camera stores no timing
+information, so this is a choice rather than a measurement.
+.TP
 .BI \-\-jpeg\-quality " N"
 JPEG quality, 1 to 100. Default 92.
 .TP
@@ -175,13 +179,18 @@ Grants your login session access to the camera. Installed by this package.
 .I ~/Pictures/blink-pics
 Default output directory.
 .SH "VIDEO CLIPS"
-Untested. No clip has ever been seen on this camera, and the only evidence
-they exist is a flag byte in the directory table which
-.BR blink2.c
-names ".avi" without inspecting the data. blinky checks the bytes instead: a
-RIFF/AVI header gets the .avi extension, and anything else is saved as .bin
-with a warning rather than being given a container's name it may not deserve.
-The camera's bytes are preserved exactly in both cases.
+A clip is stored as Motion JPEG: complete JFIF frames laid end to end, padded
+to 8-byte boundaries. It is not an AVI, despite libgphoto2 naming such entries
+".avi" without inspecting them. Frames are 320x120 and carry the same
+two-field interleave as a still, so each de-interleaves to 320x240.
+.PP
+blinky splits the stream, de-interleaves every frame and writes a real MJPEG
+AVI. The camera records no timing, so the frame rate is a choice: see
+.BR \-\-fps .
+Rebuilding the container re-encodes each frame, which is a second lossy pass,
+so the camera's own bytes are kept in the raw folder and
+.B blinky decode
+can rebuild the video from them at any time.
 .SH NOTES
 This camera's USB link can be fragile. Errors such as \fB-71\fR (EPROTO) or
 \fBdisabled by hub (EMI?)\fR in the kernel log are link-layer faults: the cable,

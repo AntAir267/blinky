@@ -150,7 +150,7 @@ def dl_args(out, **kw):
     base = dict(out=out, images=None, force=False, timeout=5000, retries=3,
                 chunk=4096, verbose=False, quiet=True, format="png",
                 jpeg_quality=92, no_skip_duplicates=False, delete_after=False,
-                naming="continue", no_raw_subfolder=False)
+                naming="continue", no_raw_subfolder=False, fps=10)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -165,7 +165,9 @@ def tree(d):
 
 
 def raws(d):
-    return sorted(f for f in tree(d) if f.endswith((".raw", ".avi")))
+    """Only .raw: since clips gained a raw of their own, the .avi is derived
+    output like a .png, not camera data."""
+    return sorted(f for f in tree(d) if f.endswith(".raw"))
 
 
 def test_download(blobs):
@@ -177,8 +179,9 @@ def test_download(blobs):
                     blinky.RunState())
     got = tree(tmp)
     check("exit 0", rc == 0, rc)
-    check("raw goes to raw/, picture and clip stay with the pictures",
-          got == ["image0000.png", "image0001.avi", "raw/image0000.raw"], got)
+    check("pictures and clips on top, camera bytes in raw/",
+          got == ["image0000.png", "image0001.avi",
+                  "raw/image0000.raw", "raw/image0001.raw"], got)
     check("the .raw is the camera's exact bytes",
           open(os.path.join(tmp, "raw", "image0000.raw"), "rb").read()
           == blobs[0][0])
@@ -189,12 +192,12 @@ def test_download(blobs):
         check("PNG is 640x480 from a 640x240 JPEG", im.size == (640, 480), im.size)
     check("no .part files left behind", not any(f.endswith(".part") for f in got))
     check("-q leaves only the summary on stdout",
-          "Done: 3 file(s) written" in out and "saved raw" not in out, repr(out))
+          "Done: 4 file(s) written" in out and "saved raw" not in out, repr(out))
 
     rc, _ = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
                   blinky.RunState())
     check("re-running skips rather than overwriting",
-          rc == 0 and len(tree(tmp)) == 3, tree(tmp))
+          rc == 0 and len(tree(tmp)) == 4, tree(tmp))
 
     tmp2 = tempfile.mkdtemp()
     cam, sim = make_cam(blobs)
@@ -204,7 +207,7 @@ def test_download(blobs):
     # Names come from the output folder's own sequence, not the camera's
     # index, so selecting entry 1 into an empty folder yields image0000.
     check("--images selects just the one photo",
-          tree(tmp2) == ["image0000.avi"], tree(tmp2))
+          tree(tmp2) == ["image0000.avi", "raw/image0000.raw"], tree(tmp2))
     try:
         blinky.parse_image_spec("9", 2)
         check("an out-of-range --images is rejected", False)
@@ -221,7 +224,7 @@ def test_duplicates_and_formats(blobs):
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
     first = tree(tmp)
-    check("first run saved everything", len(first) == 3, first)
+    check("first run saved everything", len(first) == 4, first)
 
     # Rename everything: a name-based check would now re-download the lot.
     for name in first:
@@ -265,8 +268,9 @@ def test_duplicates_and_formats(blobs):
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
           Log(quiet=True), blinky.RunState())
+    # Two rounds of two items, none recognised by name after the rename.
     check("--no-skip-duplicates re-downloads a renamed photo",
-          len([f for f in raws(tmp3) if f.endswith(".raw")]) == 2, tree(tmp3))
+          len(raws(tmp3)) == 4, tree(tmp3))
 
     # Formats.
     from PIL import Image
@@ -293,10 +297,10 @@ def test_raw_subfolder(blobs):
     cam, sim = make_cam(blobs)
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
-    check("raws go to raw/, pictures stay put",
-          tree(tmp) == ["image0000.png", "image0001.avi", "raw/image0000.raw"],
-          tree(tmp))
-    check("a clip stays with the pictures, being what you watch",
+    check("raws go to raw/, pictures and clips stay put",
+          tree(tmp) == ["image0000.png", "image0001.avi",
+                        "raw/image0000.raw", "raw/image0001.raw"], tree(tmp))
+    check("the playable clip sits with the pictures",
           os.path.exists(os.path.join(tmp, "image0001.avi")))
 
     # Duplicate detection has to see into raw/ or everything re-downloads.
@@ -325,10 +329,103 @@ def test_raw_subfolder(blobs):
     quiet(blinky.cmd_download, dl_args(tmp2, no_raw_subfolder=True),
           Log(quiet=True), blinky.RunState())
     check("--no-raw-subfolder keeps everything in one folder",
-          tree(tmp2) == ["image0000.png", "image0000.raw", "image0001.avi"],
-          tree(tmp2))
+          tree(tmp2) == ["image0000.png", "image0000.raw",
+                         "image0001.avi", "image0001.raw"], tree(tmp2))
     shutil.rmtree(tmp)
     shutil.rmtree(tmp2)
+
+
+def test_clips():
+    section("clips: Motion JPEG in, playable AVI out")
+    import io as _io, struct as _struct
+    from PIL import Image as _Image
+
+    def mjpeg(n, w=320, h=120, pad=True):
+        """n JPEG frames end to end, padded to 8 bytes like the camera does."""
+        out = bytearray()
+        for k in range(n):
+            im = _Image.new("RGB", (w, h))
+            px = im.load()
+            for y in range(h):
+                for x in range(0, w, 8):
+                    px[x, y] = ((x + k * 9) % 256, (y * 2) % 256, (x ^ y) % 256)
+            buf = _io.BytesIO(); im.save(buf, "JPEG", quality=80)
+            out += buf.getvalue()
+            if pad:
+                out += b"\x00" * ((-len(out)) % 8)
+        return bytes(out)
+
+    blob = mjpeg(5)
+    check("frames are found in a concatenated stream",
+          len(blinky.split_clip_frames(blob)) == 5,
+          len(blinky.split_clip_frames(blob)))
+    check("a single-frame clip works too",
+          len(blinky.split_clip_frames(mjpeg(1))) == 1)
+    check("non-JPEG data yields no frames",
+          blinky.split_clip_frames(b"\x00" * 512) == [])
+
+    log = Log(quiet=True)
+    w, h, frames, partials = blinky.decode_clip(blob, log)
+    check("each frame is de-interleaved to double height",
+          (w, h) == (320, 240), (w, h))
+    check("every frame survives", len(frames) == 5, len(frames))
+    check("and each is a JPEG", all(f[:2] == b"\xff\xd8" for f in frames))
+
+    tmp = tempfile.mkdtemp()
+    avi = os.path.join(tmp, "clip.avi")
+    blinky.write_mjpeg_avi(avi, frames, w, h, fps=10)
+    d = open(avi, "rb").read()
+    check("the AVI is RIFF/AVI", d[:4] == b"RIFF" and d[8:12] == b"AVI ")
+    check("its RIFF size field matches the file",
+          _struct.unpack("<I", d[4:8])[0] == len(d) - 8)
+    off = d.find(b"avih") + 8
+    usec, = _struct.unpack("<I", d[off:off + 4])
+    total, = _struct.unpack("<I", d[off + 16:off + 20])
+    aw, ah = _struct.unpack("<II", d[off + 32:off + 40])
+    check("the header agrees with the content",
+          (total, aw, ah) == (5, 320, 240), (total, aw, ah))
+    check("10 fps is recorded as 100000 us/frame", usec == 100000, usec)
+    check("it carries hdrl, movi and an index",
+          all(k in d for k in (b"hdrl", b"movi", b"idx1")))
+    # Count the frame chunks independently of the writer.
+    n = 0
+    p2 = d.find(b"movi") + 4
+    while p2 + 8 <= len(d) and d[p2:p2 + 4] == b"00dc":
+        ln, = _struct.unpack("<I", d[p2 + 4:p2 + 8])
+        if d[p2 + 8:p2 + 10] == b"\xff\xd8":
+            n += 1
+        p2 += 8 + ln + (ln & 1)
+    check("every frame chunk holds a JPEG", n == 5, n)
+
+    # A clip that is already an AVI is copied, not re-encoded.
+    passthrough = make_avi(2048)
+    out2 = os.path.join(tmp, "pass.avi")
+    blinky.build_clip(passthrough, out2, Log(quiet=True))
+    check("an AVI from the camera is passed through untouched",
+          open(out2, "rb").read() == passthrough)
+    shutil.rmtree(tmp)
+
+    # Download a clip end to end.
+    tmp = tempfile.mkdtemp()
+    cam, sim = make_cam([(blob + b"\x00" * ((-len(blob)) % 8), True)])
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
+    check("download keeps the raw and writes a playable AVI",
+          tree(tmp) == ["image0000.avi", "raw/image0000.raw"], tree(tmp))
+    check("the kept raw is the camera's exact bytes",
+          open(os.path.join(tmp, "raw", "image0000.raw"), "rb").read()
+          == blob + b"\x00" * ((-len(blob)) % 8))
+
+    # Re-decoding that raw must not silently produce a single still.
+    rc, out = quiet(blinky.cmd_decode,
+                    argparse.Namespace(files=[os.path.join(tmp, "raw",
+                                                           "image0000.raw")],
+                                       out=tmp, force=True, format="png",
+                                       jpeg_quality=92, fps=10),
+                    Log(quiet=True), blinky.RunState())
+    check("decode rebuilds the video, not one frame",
+          rc == 0 and "5 frames" in out, out)
+    shutil.rmtree(tmp)
 
 
 def test_clip_format():
@@ -346,8 +443,8 @@ def test_clip_format():
     cam, sim = make_cam([(make_avi(4096), True)])
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
-    check("a real AVI is saved as .avi", tree(tmp) == ["image0000.avi"],
-          tree(tmp))
+    check("a real AVI is passed through as .avi",
+          tree(tmp) == ["image0000.avi", "raw/image0000.raw"], tree(tmp))
     check("and byte for byte what the camera sent",
           open(os.path.join(tmp, "image0000.avi"), "rb").read()
           == make_avi(4096))
@@ -360,12 +457,14 @@ def test_clip_format():
     blinky.open_camera = lambda a, l: cam
     log = Log(quiet=True)
     quiet(blinky.cmd_download, dl_args(tmp), log, blinky.RunState())
-    check("an unrecognised clip is saved as .bin", tree(tmp) == ["image0000.bin"],
-          tree(tmp))
-    check("and it says so rather than pretending",
-          "not an AVI container" in log.transcript(), log.transcript()[-200:])
-    check("the bytes are still kept exactly",
-          open(os.path.join(tmp, "image0000.bin"), "rb").read() == mystery)
+    check("an unusable clip still leaves the camera's bytes on disk",
+          tree(tmp) == ["raw/image0000.raw"], tree(tmp))
+    check("and says it could not build a video",
+          "could not build a video" in log.transcript(),
+          log.transcript()[-200:])
+    check("the bytes are kept exactly",
+          open(os.path.join(tmp, "raw", "image0000.raw"), "rb").read()
+          == mystery)
     shutil.rmtree(tmp)
 
 
@@ -526,7 +625,7 @@ def test_decode_command():
     raw = os.path.join(tmp, "image0009.raw")
     open(raw, "wb").write(make_jpeg())
     a = argparse.Namespace(files=[raw], out=tmp, force=False, format="png",
-                           jpeg_quality=92)
+                           jpeg_quality=92, fps=10)
     rc, _ = quiet(blinky.cmd_decode, a, Log(quiet=True), blinky.RunState())
     check("exit 0", rc == 0)
     from PIL import Image
@@ -538,7 +637,7 @@ def test_decode_command():
     open(bogus, "wb").write(os.urandom(500))
     rc, _ = quiet(blinky.cmd_decode,
                   argparse.Namespace(files=[bogus], out=tmp, force=False,
-                                     format="png", jpeg_quality=92),
+                                     format="png", jpeg_quality=92, fps=10),
                   Log(quiet=True), blinky.RunState())
     check("non-JPEG data fails cleanly", rc == 1)
     shutil.rmtree(tmp)
@@ -802,7 +901,7 @@ def test_wipe_and_recapture():
     def digests(d):
         import hashlib as _h
         return {_h.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
-                for f in raws(d)}
+                for f in tree(d) if f.endswith((".raw", ".avi"))}
 
     def all_present(d, blobs):
         import hashlib as _h
@@ -977,6 +1076,7 @@ def main():
     test_wipe_and_recapture()
     test_raw_subfolder(blobs)
     test_clip_format()
+    test_clips()
     test_delete_safety(blobs)
     test_delete_command(blobs)
     test_list(blobs)

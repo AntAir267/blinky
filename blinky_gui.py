@@ -968,6 +968,22 @@ class PhotoRow(QWidget):
             self.saved_path = saved_path
         self.update()
 
+    @staticmethod
+    def _first_frame(path):
+        """Pull frame one out of an MJPEG AVI, for the row's thumbnail."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(1 << 20)
+        except OSError:
+            return None
+        start = head.find(b"\xff\xd8")
+        if start < 0:
+            return None
+        end = head.find(b"\xff\xd9", start + 2)
+        pm = QPixmap()
+        pm.loadFromData(head[start:end + 2] if end > 0 else head[start:], "JPEG")
+        return pm if not pm.isNull() else None
+
     def _thumb(self):
         if not self.saved_path:
             return None
@@ -976,11 +992,15 @@ class PhotoRow(QWidget):
         # The picture sits beside the raw, or one level up when raws are
         # kept in a raw/ subfolder.
         for folder in (here, os.path.dirname(here)):
-            for ext in (".png", ".jpg"):
+            for ext in (".png", ".jpg", ".avi"):
                 path = os.path.join(folder, base + ext)
-                if os.path.exists(path):
+                if not os.path.exists(path):
+                    continue
+                if ext == ".avi":
+                    pm = self._first_frame(path)
+                else:
                     pm = QPixmap(path)
-                    if not pm.isNull():
+                if pm is not None and not pm.isNull():
                         return pm.scaled(
                             44, 33, Qt.AspectRatioMode.KeepAspectRatio,
                             Qt.TransformationMode.SmoothTransformation)
@@ -1672,21 +1692,33 @@ class BlinkyWindow(QWidget):
                     stem = "image%04d" % counter
                     counter += 1
                     if e.is_movie:
-                        # A clip needs no decoding; the saved file is the raw
-                        # data. Name it after the container we actually find.
-                        ext, known = blinky.movie_extension(data)
-                        if not known:
-                            log.warn("%s is flagged as a clip but is not an "
-                                     "AVI; saving as %s" % (e.basename, ext))
-                        path = blinky.free_path(
-                            os.path.join(outdir, stem + ext))
-                        blinky.write_file_atomically(path, data)
-                        paths[i] = path
-                        job.item.emit(i, "done")
-                        states[i] = "done"
-                        verified[i] = (path, len(data),
+                        # A clip is Motion JPEG: keep the camera's bytes and
+                        # build a playable AVI from them, exactly as a still
+                        # keeps its raw and gains a picture.
+                        raw = blinky.free_path(
+                            os.path.join(rawdir, stem + ".raw"))
+                        blinky.write_file_atomically(raw, data)
+                        paths[i] = raw
+                        verified[i] = (raw, len(data),
                                        hashlib.sha256(data).hexdigest())
-                        saved += 1
+                        base = os.path.splitext(os.path.basename(raw))[0]
+                        try:
+                            n, w, h = blinky.build_clip(
+                                data, os.path.join(outdir, base + ".avi"), log)
+                            log.out("%s: %d frame%s at %dx%d"
+                                    % (e.basename, n, "" if n == 1 else "s",
+                                       w, h))
+                            job.item.emit(i, "done")
+                            states[i] = "done"
+                            saved += 1
+                        except blinky.CameraError as exc:
+                            log.error("%s: could not build a video: %s"
+                                      % (e.basename, exc))
+                            log.info("the camera's bytes are kept at %s" % raw)
+                            job.item.emit(i, "failed")
+                            states[i] = "failed"
+                            failures.append((e.basename, str(exc)))
+                            failed += 1
                         continue
 
                     # free_path is a belt-and-braces guard: the counter should

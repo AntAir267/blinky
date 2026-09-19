@@ -1,3 +1,21 @@
+blinky (1.4-1) unstable; urgency=low
+
+  * Support video clips properly, now that the format is known. A clip is
+    Motion JPEG -- whole JFIF frames end to end, padded to 8 bytes -- not an
+    AVI, so the .avi name libgphoto2 gives them produces a file nothing will
+    play. Frames are 320x120 and carry the same two-field interleave as a
+    still, decoding to 320x240.
+  * Clips now keep their raw bytes in raw/ like stills do, and gain a real
+    MJPEG AVI built beside the pictures, with hdrl/movi/idx1 written by hand
+    and no ffmpeg needed.
+  * blinky decode rebuilds a video from a kept raw, instead of silently
+    decoding only its first frame into a photograph.
+  * Add --fps. The camera records no timing, so the rate is a choice; 10 is
+    the default.
+  * The window shows a clip's first frame as its thumbnail.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 09:40:00 +0000
+
 blinky (1.3-1) unstable; urgency=low
 
   * Download to blink-pics inside the user's Pictures folder by default,
