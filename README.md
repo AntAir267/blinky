@@ -1,5 +1,7 @@
 # blinky
 
+[![tests](https://github.com/AntAir267/blinky/actions/workflows/tests.yml/badge.svg)](https://github.com/AntAir267/blinky/actions/workflows/tests.yml)
+
 A standalone Python + pyusb tool for the **SiPix StyleCam Blink II** (USB `0c77:1011`).
 It speaks the camera's vendor protocol directly, reproducing what libgphoto2's
 `camlibs/sipix/blink2.c` does, with retries, raw-data preservation, PNG output
