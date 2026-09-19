@@ -826,6 +826,129 @@ class CameraGlyph(QWidget):
         p.drawEllipse(QRectF(25 * k, 12.5 * k, 4.5 * k, 4.5 * k))
 
 
+def paint_icon(p, size):
+    """Draw the Blinky mark: a chunky camera in translucent candy plastic.
+
+    Detail is dropped below 32px on purpose -- at icon sizes the silhouette
+    and the lens are all that survive, and keeping the rest turns to mush.
+    """
+    k = size / 128.0
+    detailed = size >= 32
+    tiny = size < 24          # below this, rings and outlines cost more
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)  # pixels than they earn
+
+    # Small icons are not the big one with bits removed: the body fills more
+    # of the canvas and the lens takes a bigger share, or nothing reads.
+    if detailed:
+        body = QRectF(9 * k, 34 * k, 110 * k, 80 * k)
+        radius = 18 * k
+    else:
+        body = QRectF(5 * k, 26 * k, 118 * k, 92 * k)
+        radius = 22 * k
+    shell = QPainterPath()
+    shell.addRoundedRect(body, radius, radius)
+    if detailed:
+        hump = QPainterPath()
+        hump.addRoundedRect(QRectF(34 * k, 18 * k, 44 * k, 26 * k),
+                            9 * k, 9 * k)
+        shell = shell.united(hump)
+
+    g = QLinearGradient(QPointF(0, body.top()), QPointF(0, body.bottom()))
+    g.setColorAt(0.00, QColor("#7FD0F5"))
+    g.setColorAt(0.44, QColor("#3E9BD8"))
+    g.setColorAt(0.50, QColor("#2477BE"))
+    g.setColorAt(0.86, QColor("#2E86CC"))
+    g.setColorAt(1.00, QColor("#6FC2EC"))
+    p.fillPath(shell, QBrush(g))
+
+    if detailed:
+        # gloss sweep across the upper body
+        p.save()
+        p.setClipPath(shell)
+        gloss = QRectF(body.left(), body.top() - 22 * k,
+                       body.width(), 58 * k)
+        gg = QLinearGradient(gloss.topLeft(), gloss.bottomLeft())
+        gg.setColorAt(0.0, QColor(255, 255, 255, 215))
+        gg.setColorAt(1.0, QColor(255, 255, 255, 25))
+        gp = QPainterPath()
+        gp.addRoundedRect(gloss, 26 * k, 26 * k)
+        p.fillPath(gp, QBrush(gg))
+        p.restore()
+
+    if not tiny:
+        p.setPen(QPen(QColor("#12507F"), max(1.0, 2.0 * k)))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(shell)
+
+    # Lens: the one thing that must read at every size.
+    if detailed:
+        lens = QRectF(38 * k, 50 * k, 52 * k, 52 * k)
+    else:
+        d = (78 if tiny else 66) * k
+        lens = QRectF(body.center().x() - d / 2, body.center().y() - d / 2, d, d)
+    if tiny:
+        # One circle, no ring: the silhouette plus a lens is all that survives.
+        glass = lens
+    else:
+        p.setPen(QPen(QColor("#0E3E66"), max(1.0, 2.2 * k)))
+        ring = QLinearGradient(lens.topLeft(), lens.bottomLeft())
+        ring.setColorAt(0.0, QColor("#D8E8F4"))
+        ring.setColorAt(1.0, QColor("#6E8CA8"))
+        p.setBrush(QBrush(ring))
+        p.drawEllipse(lens)
+        glass = lens.adjusted(*([6 * k, 6 * k, -6 * k, -6 * k] if detailed
+                                else [8 * k, 8 * k, -8 * k, -8 * k]))
+    lg = QRadialGradient(QPointF(glass.center().x() - 7 * k,
+                                 glass.center().y() - 9 * k), 46 * k)
+    lg.setColorAt(0.00, QColor("#EAF8FF"))
+    lg.setColorAt(0.32, QColor("#3E92D4"))
+    lg.setColorAt(0.75, QColor("#123E6E"))
+    lg.setColorAt(1.00, QColor("#08203C"))
+    p.setBrush(QBrush(lg))
+    p.setPen(QPen(QColor("#07203A"), max(1.0, 1.4 * k))
+             if not tiny else Qt.PenStyle.NoPen)
+    p.drawEllipse(glass)
+
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(255, 255, 255, 225))
+    p.drawEllipse(QRectF(glass.left() + glass.width() * 0.18,
+                         glass.top() + glass.height() * 0.13,
+                         glass.width() * 0.40, glass.height() * 0.26))
+    if detailed:
+        p.setBrush(QColor(255, 255, 255, 120))
+        p.drawEllipse(QRectF(glass.right() - 14 * k, glass.bottom() - 15 * k,
+                             8 * k, 6 * k))
+        # Flash bead, and a sparkle off it, because it is 2001.
+        flash = QRectF(96 * k, 44 * k, 16 * k, 16 * k)
+        fg = QRadialGradient(QPointF(flash.center().x() - 2 * k,
+                                     flash.center().y() - 3 * k), 15 * k)
+        fg.setColorAt(0.0, QColor("#FFF6D8"))
+        fg.setColorAt(0.55, QColor("#FFC93C"))
+        fg.setColorAt(1.0, QColor("#C98908"))
+        p.setBrush(QBrush(fg))
+        p.setPen(QPen(QColor("#9A6A06"), max(1.0, 1.4 * k)))
+        p.drawEllipse(flash)
+        paint_sparkle(p, 110 * k, 30 * k, 11 * k, QColor(255, 255, 255, 235))
+    return shell
+
+
+def icon_pixmap(size):
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    paint_icon(p, size)
+    p.end()
+    return pm
+
+
+def app_icon():
+    """A QIcon carrying every size, so window managers pick a sharp one."""
+    icon = QIcon()
+    for size in (16, 22, 24, 32, 48, 64, 128, 256):
+        icon.addPixmap(icon_pixmap(size))
+    return icon
+
+
 class PhotoRow(QWidget):
     """One directory entry, with its thumbnail once it has been saved."""
 
@@ -1583,7 +1706,11 @@ def main(argv=None):
     app = QApplication(argv if argv is not None else sys.argv)
     app.setApplicationName("Blinky")
     app.setApplicationDisplayName("Blinky")
+    # Lets the compositor match the window to blinky.desktop on Wayland.
+    app.setDesktopFileName("blinky")
     app.setFont(ui_font(8))
+    themed = QIcon.fromTheme("blinky")
+    app.setWindowIcon(themed if not themed.isNull() else app_icon())
     win = BlinkyWindow()
     win.show()
     return app.exec()

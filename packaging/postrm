@@ -3,6 +3,9 @@ set -e
 
 case "$1" in
     remove|purge)
+        if command -v update-icon-caches >/dev/null 2>&1; then
+            update-icon-caches /usr/share/icons/hicolor >/dev/null 2>&1 || true
+        fi
         if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
             udevadm control --reload-rules >/dev/null 2>&1 || true
         fi

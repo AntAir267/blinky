@@ -663,6 +663,23 @@ def test_gui_chrome():
           w2.grip.geometry().topLeft() == QPoint(680 - 18, 780 - 18),
           w2.grip.geometry().topLeft())
 
+    # An icon that renders blank is easy to ship and hard to notice.
+    ink = []
+    for size in (16, 22, 24, 32, 48, 64, 128, 256):
+        img = blinky_gui.icon_pixmap(size).toImage()
+        opaque = sum(1 for y in range(size) for x in range(size)
+                     if img.pixelColor(x, y).alpha() > 40)
+        ink.append((size, opaque / float(size * size)))
+    check("the icon draws something at every size",
+          all(frac > 0.25 for _, frac in ink),
+          ["%d:%.2f" % (s, f) for s, f in ink])
+    check("and does not just fill the square",
+          all(frac < 0.95 for _, frac in ink),
+          ["%d:%.2f" % (s, f) for s, f in ink])
+    check("the app icon carries every size",
+          len(blinky_gui.app_icon().availableSizes()) >= 6,
+          blinky_gui.app_icon().availableSizes())
+
     # move() is a no-op on Wayland, so dragging must go via the compositor.
     src = open(os.path.join(os.path.dirname(HERE), "blinky_gui.py")).read()
     check("dragging asks the compositor (startSystemMove)",

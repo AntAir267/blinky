@@ -13,6 +13,9 @@ blinky (1.1-1) unstable; urgency=low
   * Report a USB stall as its own condition, with the only fix that works.
   * blinky-gui: options for format, duplicate skipping and erase-after, the
     last behind a confirmation and the shared safety check.
+  * Add an application icon, installed into /usr/share/icons/hicolor at nine
+    sizes and used for the window itself. Rendered from the same code that
+    paints the window, so the two cannot drift.
   * blinky-gui: fix a window that could not be moved and title bar buttons
     that did nothing. Dragging now goes through startSystemMove, since
     Wayland does not let a client position itself; the traffic lights accept

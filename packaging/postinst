@@ -5,6 +5,15 @@ case "$1" in
     configure)
         # udev only applies rules when a device appears, so reload and retrigger
         # in case the camera is already plugged in.
+        if command -v update-icon-caches >/dev/null 2>&1; then
+            update-icon-caches /usr/share/icons/hicolor >/dev/null 2>&1 || true
+        elif command -v gtk-update-icon-cache >/dev/null 2>&1; then
+            gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor \
+                >/dev/null 2>&1 || true
+        fi
+        if command -v update-desktop-database >/dev/null 2>&1; then
+            update-desktop-database -q /usr/share/applications || true
+        fi
         if [ -d /run/udev ] && command -v udevadm >/dev/null 2>&1; then
             udevadm control --reload-rules >/dev/null 2>&1 || true
             udevadm trigger --subsystem-match=usb --attr-match=idVendor=0c77 \

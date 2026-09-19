@@ -49,6 +49,19 @@ chmod 755 "$build/usr/bin/blinky" "$build/usr/bin/blinky-gui"
 
 install -m 644 "$here/70-blinky-sipix.rules" "$build/usr/lib/udev/rules.d/"
 install -m 644 "$here/blinky.desktop"        "$build/usr/share/applications/"
+
+# Icons are rendered from blinky_gui.paint_icon so the window icon and the
+# desktop icon are the same drawing. Regenerate if PyQt6 is available;
+# otherwise use whatever is already checked in.
+if python3 -c "import PyQt6" 2>/dev/null; then
+    python3 "$here/make-icons.py" "$here/icons" >/dev/null
+fi
+for dir in "$here"/icons/*/; do
+    sz=$(basename "$dir")
+    [ -f "$dir/blinky.png" ] || continue
+    install -D -m 644 "$dir/blinky.png" \
+        "$build/usr/share/icons/hicolor/$sz/apps/blinky.png"
+done
 install -m 644 "$here/blinky.bash-completion" \
                "$build/usr/share/bash-completion/completions/blinky"
 install -m 644 "$here/copyright"             "$build/usr/share/doc/blinky/"

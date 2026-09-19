@@ -55,6 +55,8 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="0c77", ATTR{idProduct}=="1011", TAG+="uaccess
 
 ## The window
 
+<img src="docs/icon.png" width="96" align="right" alt="Blinky icon">
+
 ![Blinky](docs/screenshot.png)
 
 `blinky-gui` does the same things without the terminal: finds the camera, lists
@@ -71,6 +73,14 @@ painted rather than themed, so it looks the same on any desktop.
 
 It needs PyQt6 (`python3-pyqt6`). The command line tool does not, and the
 package only recommends it.
+
+The icon is drawn by the same code that paints the window, in
+`blinky_gui.paint_icon`, and `packaging/make-icons.py` renders it to the
+hicolor sizes at build time. There is deliberately no hand-written SVG: a
+second copy of the drawing is a second thing to keep in step, and it would
+drift. Below 32px the art changes rather than just shrinking — the body fills
+more of the canvas, and under 24px the lens ring and outlines are dropped
+entirely, because at that scale they cost more pixels than they earn.
 
 The window is frameless so the chrome can be drawn rather than themed, which
 means two things have to be asked of the compositor rather than done directly:
