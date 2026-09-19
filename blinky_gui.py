@@ -12,6 +12,7 @@ All camera work is done by the blinky module on a worker thread; this file
 contains no protocol code.
 """
 
+import hashlib
 import os
 import sys
 import time
@@ -276,6 +277,142 @@ class GelButton(QWidget):
         else:
             p.setPen(QColor("#A7B3C0"))
         p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.text)
+
+
+class Segmented(QWidget):
+    """An Aqua segmented control: one pill divided into pressed-in choices."""
+
+    changed = pyqtSignal(str)
+
+    def __init__(self, options, parent=None, width=None):
+        super().__init__(parent)
+        self.options = list(options)             # [(value, label), ...]
+        self.index = 0
+        self._hover = -1
+        self.setFixedHeight(22)
+        self.setFont(ui_font(8))
+        w = width or (sum(self.fontMetrics().horizontalAdvance(t) + 24
+                          for _, t in self.options))
+        self.setFixedWidth(w)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+
+    def value(self):
+        return self.options[self.index][0]
+
+    def setValue(self, value):
+        for i, (v, _) in enumerate(self.options):
+            if v == value:
+                self.index = i
+                self.update()
+                return
+
+    def _hit(self, x):
+        seg = self.width() / len(self.options)
+        return max(0, min(len(self.options) - 1, int(x // seg)))
+
+    def mouseMoveEvent(self, e):
+        self._hover = self._hit(e.position().x())
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = -1
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        i = self._hit(e.position().x())
+        if i != self.index:
+            self.index = i
+            self.update()
+            self.changed.emit(self.value())
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        paint_gel(p, r, GEL_GREY, radius=r.height() / 2)
+        seg = r.width() / len(self.options)
+        p.save()
+        path = QPainterPath()
+        path.addRoundedRect(r, r.height() / 2, r.height() / 2)
+        p.setClipPath(path)
+        for i, (_, label) in enumerate(self.options):
+            cell = QRectF(r.left() + i * seg, r.top(), seg, r.height())
+            if i == self.index:
+                paint_gel(p, cell.adjusted(1, 1, -1, -1), GEL_BLUE,
+                          radius=(cell.height() - 2) / 2, gloss=0.42)
+            elif i == self._hover:
+                p.fillRect(cell, QColor(255, 255, 255, 90))
+            if i:
+                p.setPen(QPen(QColor(0, 0, 0, 40), 1))
+                p.drawLine(QPointF(cell.left(), r.top() + 3),
+                           QPointF(cell.left(), r.bottom() - 3))
+            p.setFont(ui_font(8, bold=(i == self.index)))
+            p.setPen(QColor("#FFFFFF") if i == self.index else INK)
+            p.drawText(cell, Qt.AlignmentFlag.AlignCenter, label)
+        p.restore()
+        p.setPen(QPen(QColor("#8CA0B8"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
+class AquaCheck(QWidget):
+    """A gel checkbox with its label, in the same idiom as the buttons."""
+
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, text, checked=False, parent=None, tint=None):
+        super().__init__(parent)
+        self.text = text
+        self.checked = checked
+        self.tint = tint
+        self._hover = False
+        self.setFont(ui_font(8))
+        self.setFixedHeight(18)
+        self.setMinimumWidth(self.fontMetrics().horizontalAdvance(text) + 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def isChecked(self):
+        return self.checked
+
+    def setChecked(self, on):
+        if on != self.checked:
+            self.checked = on
+            self.update()
+            self.toggled.emit(on)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self.rect().contains(e.position().toPoint()):
+            self.setChecked(not self.checked)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        box = QRectF(0.5, 2.5, 13, 13)
+        colors = GEL_GREY
+        if self.checked:
+            colors = GEL_CANDY if self.tint == "warn" else GEL_BLUE
+        paint_gel(p, box, colors, radius=3.5,
+                  gloss=0.45 if self.checked else 1.0)
+        if self.checked:
+            p.setPen(QPen(QColor("#FFFFFF"), 2.0,
+                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.drawPolyline(QPolygonF([QPointF(3.6, 9.2), QPointF(6.2, 11.8),
+                                      QPointF(10.6, 5.6)]))
+        p.setFont(self.font())
+        p.setPen(QColor("#9A6A00") if self.tint == "warn" and self.checked
+                 else INK if self._hover or self.checked else INK_SOFT)
+        p.drawText(QRectF(19, 0, self.width() - 19, self.height()),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.text)
 
 
 class TrafficLight(QWidget):
@@ -831,8 +968,8 @@ class BlinkyWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMinimumSize(600, 676)
-        self.resize(600, 716)
+        self.setMinimumSize(600, 760)
+        self.resize(600, 800)
 
         self.outdir = blinky.DEFAULT_OUTDIR
         self.entries = []
@@ -943,6 +1080,38 @@ class BlinkyWindow(QWidget):
         dest.addWidget(self.btn_folder)
         lay.addLayout(dest)
 
+        opts = LunaGroup("Options", self)
+        row1 = QHBoxLayout()
+        row1.setSpacing(9)
+        fmtlabel = QLabel("Save stills as")
+        fmtlabel.setFont(ui_font(8, bold=True))
+        fmtlabel.setStyleSheet("color:#20303F;")
+        row1.addWidget(fmtlabel)
+        self.fmt = Segmented([("png", "PNG"), ("jpeg", "JPEG"),
+                              ("both", "Both")], self)
+        row1.addWidget(self.fmt)
+        self.fmtnote = QLabel("lossless from the decoded pixels")
+        self.fmtnote.setFont(ui_font(8))
+        self.fmtnote.setStyleSheet("color:#5B6C7D;")
+        self.fmt.changed.connect(self._format_changed)
+        row1.addWidget(self.fmtnote, 1)
+        opts.addLayout(row1)
+
+        self.skipdupes = AquaCheck(
+            "Skip photos already in this folder, even if renamed", True, self)
+        opts.addWidget(self.skipdupes)
+        self.eraseafter = AquaCheck(
+            "Erase the camera after downloading", False, self, tint="warn")
+        self.eraseafter.toggled.connect(self._erase_toggled)
+        opts.addWidget(self.eraseafter)
+        self.erasenote = QLabel("")
+        self.erasenote.setFont(ui_font(8))
+        self.erasenote.setStyleSheet("color:#9A6A00;")
+        self.erasenote.setWordWrap(True)
+        self.erasenote.hide()
+        opts.addWidget(self.erasenote)
+        lay.addWidget(opts)
+
         foot = QHBoxLayout()
         foot.setSpacing(10)
         self.bar = BarberPole(self)
@@ -975,6 +1144,75 @@ class BlinkyWindow(QWidget):
         p.setPen(QPen(QColor("#4C6A8E"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+
+    def _format_changed(self, value):
+        self.fmtnote.setText({
+            "png": "lossless from the decoded pixels",
+            "jpeg": "smaller, but a second lossy pass",
+            "both": "PNG and JPEG side by side",
+        }[value])
+
+    def _erase_toggled(self, on):
+        self.erasenote.setVisible(on)
+        self.erasenote.setText(
+            "The camera has no per-photo delete, so this erases everything. "
+            "It only runs if every photo downloads and verifies on disk, and "
+            "you will be asked once more before anything is erased.")
+        self.btn_download.text = "Download and Erase" if on else "Download All"
+        self.btn_download.update()
+
+    def _confirm_erase(self, count):
+        """A plain modal in the app's own idiom, not a system dialog."""
+        from PyQt6.QtWidgets import QDialog
+        dlg = QDialog(self)
+        dlg.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                           Qt.WindowType.Dialog)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setFixedWidth(400)
+        box = QVBoxLayout(dlg)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+        bar = TitleBar("Erase the camera?", dlg)
+        bar.close_clicked.connect(dlg.reject)
+        bar.minimise_clicked.connect(dlg.reject)
+        box.addWidget(bar)
+        panel = QWidget(dlg)
+        box.addWidget(panel)
+        inner = QVBoxLayout(panel)
+        inner.setContentsMargins(16, 14, 16, 14)
+        inner.setSpacing(12)
+        msg = QLabel("All %d photo%s will be downloaded, verified on disk, and "
+                     "then erased from the camera.\n\nThe camera has no undo."
+                     % (count, "" if count == 1 else "s"))
+        msg.setFont(ui_font(9))
+        msg.setWordWrap(True)
+        msg.setStyleSheet("color:#20303F;")
+        inner.addWidget(msg)
+        rowb = QHBoxLayout()
+        rowb.addStretch(1)
+        cancel = GelButton("Cancel", "grey", dlg)
+        go = GelButton("Download and Erase", "candy", dlg, width=160)
+        cancel.clicked.connect(dlg.reject)
+        go.clicked.connect(dlg.accept)
+        rowb.addWidget(cancel)
+        rowb.addWidget(go)
+        inner.addLayout(rowb)
+
+        def paint(_):
+            p = QPainter(dlg)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = QRectF(dlg.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+            path = QPainterPath()
+            path.addRoundedRect(r, 7, 7)
+            p.save()
+            p.setClipPath(path)
+            paint_pinstripes(p, dlg.rect())
+            p.restore()
+            p.setPen(QPen(QColor("#4C6A8E"), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPath(path)
+        dlg.paintEvent = paint
+        return dlg.exec() == QDialog.DialogCode.Accepted
 
     def _pretty(self, path):
         home = os.path.expanduser("~")
@@ -1125,42 +1363,71 @@ class BlinkyWindow(QWidget):
         if not self.entries:
             self.log.append("warn", "Nothing to download. Press Refresh first.")
             return
+        erase = self.eraseafter.isChecked()
+        if erase and not self._confirm_erase(len(self.entries)):
+            self.log.append("info", "Erase cancelled; nothing was downloaded.")
+            return
+
         entries, outdir = list(self.entries), self.outdir
+        fmt, quality = self.fmt.value(), 92
+        skip_dupes = self.skipdupes.isChecked()
 
         def work(job, log):
             os.makedirs(outdir, exist_ok=True)
             cam = blinky.Blink2(log)
             cam.open()
             saved = failed = partial = 0
-            states = {}
+            states, verified, failures, skipped = {}, {}, [], []
+            index = blinky.local_fingerprints(outdir) if skip_dupes else {}
+            sizes = {sz for sz, _ in index}
             try:
                 for i, e in enumerate(entries):
+                    job.step.emit(i / len(entries), "Reading %s\u2026" % e.basename)
+
+                    if index and e.data_bytes in sizes:
+                        try:
+                            key = cam.fingerprint(e)
+                        except blinky.CameraError:
+                            key = None
+                        if key in index:
+                            log.out("%s: already saved as %s"
+                                    % (e.basename,
+                                       os.path.basename(index[key])))
+                            job.item.emit(i, "done")
+                            states[i] = "done"
+                            skipped.append(e.basename)
+                            continue
+
                     job.item.emit(i, "busy")
-                    job.step.emit(i / len(entries),
-                                  "Reading %s…" % e.basename)
                     try:
                         data = cam.read_image_with_retries(e)
                     except blinky.CameraError as exc:
                         log.error("%s: %s" % (e.basename, exc))
                         job.item.emit(i, "failed")
                         states[i] = "failed"
+                        failures.append((e.basename, str(exc)))
                         failed += 1
                         continue
+
                     if e.is_movie:
                         # A clip needs no decoding, so the .avi is the raw save.
-                        blinky.write_file_atomically(
-                            os.path.join(outdir, e.basename + ".avi"), data)
+                        path = os.path.join(outdir, e.basename + ".avi")
+                        blinky.write_file_atomically(path, data)
                         job.item.emit(i, "done")
                         states[i] = "done"
+                        verified[i] = (path, len(data),
+                                       hashlib.sha256(data).hexdigest())
                         saved += 1
                         continue
+
                     raw = os.path.join(outdir, e.basename + ".raw")
                     blinky.write_file_atomically(raw, data)
+                    verified[i] = (raw, len(data),
+                                   hashlib.sha256(data).hexdigest())
                     try:
                         w, h, raster, part = blinky.decode_still(data, log)
-                        blinky.write_png(
-                            os.path.join(outdir, e.basename + ".png"),
-                            w, h, raster)
+                        blinky.write_still(outdir, e.basename, w, h, raster,
+                                           fmt, quality)
                         states[i] = "partial" if part else "done"
                         job.item.emit(i, states[i])
                         partial += 1 if part else 0
@@ -1170,19 +1437,29 @@ class BlinkyWindow(QWidget):
                         log.info("the raw data is kept at %s" % raw)
                         job.item.emit(i, "failed")
                         states[i] = "failed"
+                        failures.append((e.basename, "decode: %s" % exc))
                         failed += 1
                 job.step.emit(1.0, "")
-                return saved, failed, partial, states
+
+                erased = None
+                if erase:
+                    # Reuse the command line tool's safety rules rather than
+                    # writing a second, subtly different set of them.
+                    rc = blinky._delete_after_download(
+                        cam, log, entries, list(range(len(entries))),
+                        verified, failures, skipped)
+                    erased = (rc == 0)
+                return saved, failed, partial, states, erased
             finally:
                 cam.close()
 
         self.log.append("info", "Downloading %d photo%s to %s"
                         % (len(entries), "" if len(entries) == 1 else "s",
                            self._pretty(outdir)))
-        self.start(work, self._downloaded, "Downloading…")
+        self.start(work, self._downloaded, "Downloading\u2026")
 
     def _downloaded(self, result):
-        saved, failed, partial, states = result
+        saved, failed, partial, states, erased = result
         self.led.set_state("ok" if not failed else "bad")
         self.status.setText("Saved %d photo%s" % (saved, "" if saved == 1 else "s"))
         bits = ["%d saved" % saved]
@@ -1190,9 +1467,21 @@ class BlinkyWindow(QWidget):
             bits.append("%d partial" % partial)
         if failed:
             bits.append("%d failed" % failed)
+        if erased is True:
+            bits.append("camera erased")
+            self.entries = []
+        elif erased is False:
+            bits.append("camera NOT erased")
+            self.log.append("warn", "The camera was left untouched because "
+                                    "not every photo was verified on disk.")
         self.detail.setText(" · ".join(bits) + " · " +
                             self._pretty(self.outdir))
         self.log.append("out", "Done: " + ", ".join(bits) + ".")
+        if erased is True:
+            self._rebuild_rows()
+            self.status.setText("Saved %d and erased the camera" % saved)
+            QTimer.singleShot(400, self.refresh)
+            return
         self._rebuild_rows()
         for i, row in enumerate(self.rows):
             if i in states:

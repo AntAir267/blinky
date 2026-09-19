@@ -80,11 +80,13 @@ package only recommends it.
 | `blinky list` | Firmware ID, photo count, and the directory table |
 | `blinky download` | Fetch photos to `~/blink-pics`: raw bytes first, then decode |
 | `blinky decode RAW...` | Decode already-saved `.raw` files to PNG (no camera needed) |
+| `blinky delete` | Erase photos from the camera |
 | `blinky convert [PATH...]` | Batch-convert `.pnm` files to PNG (no camera needed) |
 | `blinky-gui` | The window shown above |
 
-Useful options: `--images 0,2-4`, `--out DIR`, `--force`, `--retries N`,
-`--timeout MS`, `-v`, and `--report [FILE]` on any command.
+Useful options: `--images 0,2-4`, `--out DIR`, `--force`, `--format both`,
+`--delete-after`, `--retries N`, `--timeout MS`, `-v`, and `--report [FILE]`
+on any command.
 
 ### Output layout
 
@@ -96,6 +98,45 @@ over a flaky link.
 
 Video clips need no decoding, so `imageNNNN.avi` **is** the untouched raw data;
 there is no separate `.raw` for a clip.
+
+### Deleting
+
+The protocol has exactly two delete commands and neither is per-image:
+request `0x12` erases **everything**, and `0x11` erases only the newest image.
+libgphoto2 implements only the first. So `blinky delete` can erase everything,
+or pop the newest *N* off one at a time with `--last N`, and nothing else.
+
+It always confirms first, and refuses outright if there is no terminal to
+confirm at, unless you pass `--yes`.
+
+`blinky download --delete-after` erases the camera once the download is done,
+but only when that is provably safe. Because the camera can only erase
+everything, it refuses if anything failed, if `--images` selected only some
+photos (erasing would destroy the rest), or if any file fails to re-read from
+disk and match byte for byte what was transferred. Photos skipped because an
+identical copy was already in the folder count as accounted for.
+
+### Duplicate detection
+
+By default a photo already in the output folder is recognised **by content**
+and not transferred again. The `.raw` and `.avi` files blinky writes are the
+camera's exact bytes, so the first 4 KB of a local file hashes to the same
+value as the camera's own — and `GET_MEMORY` honours a short length, so reading
+that prefix costs about 30 ms instead of the seconds a whole image takes.
+
+This means a photo is recognised after being renamed or moved, and a *different*
+photo that merely reuses a filename is not mistaken for it — it gets saved
+alongside under a free name rather than clobbering anything. `--no-skip-duplicates`
+falls back to matching filenames only.
+
+### Picture formats
+
+`--format png` (the default), `jpeg`, or `both`, with `--jpeg-quality`.
+
+Worth knowing before choosing: **the camera's own data is already JPEG**, so
+`png` is lossless from the decoded pixels while `jpeg` puts the image through a
+second lossy pass. The `.raw` file kept alongside is the camera's original JPEG
+bitstream and opens in any viewer as the 640x240 interleaved frame.
 
 ### `convert`
 

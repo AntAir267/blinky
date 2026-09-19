@@ -34,6 +34,15 @@ with each entry's address range and size.
 .B download
 Download photos. Raw bytes reach the disk before any decoding is attempted.
 .TP
+.B delete
+Erase photos from the camera. The protocol offers no per\-image delete: request
+.B 0x12
+erases everything and
+.B 0x11
+erases only the newest image, so those are the only two things this can do.
+Always confirms before erasing unless \fB\-\-yes\fR is given, and refuses
+outright when there is no terminal to confirm at.
+.TP
 .B decode " " \fIRAW\fR...
 Decode saved .raw files to PNG. Needs no camera.
 .TP
@@ -73,6 +82,36 @@ Which photos, for example \fB0,2-4\fR. Default: all.
 .TP
 .B \-\-force
 Re-download and overwrite existing files.
+.TP
+.BI \-\-format " png|jpeg|both"
+Picture format for stills, default \fBpng\fR. The camera's own data is already
+JPEG, so \fBpng\fR is lossless from the decoded pixels while \fBjpeg\fR puts
+the image through a second lossy pass. The .raw file blinky keeps alongside is
+the camera's original JPEG bitstream.
+.TP
+.BI \-\-jpeg\-quality " N"
+JPEG quality, 1 to 100. Default 92.
+.TP
+.B \-\-no\-skip\-duplicates
+By default a photo already present in the output folder is recognised by its
+contents and not transferred again, even if the file has been renamed. This
+turns that off and falls back to matching filenames only.
+.TP
+.B \-\-delete\-after
+Erase the camera once the download is done. Because the camera can only erase
+everything, this is refused unless every photo on it is accounted for: nothing
+failed, \fB\-\-images\fR did not select a subset, and every file written has
+been re-read from disk and checked byte for byte.
+.SH "DELETE OPTIONS"
+.TP
+.B \-\-all
+Erase every photo. This is the default.
+.TP
+.BI \-\-last " N"
+Erase only the N newest photos, by repeating the delete\-last request.
+.TP
+.B \-\-yes
+Skip the confirmation prompt.
 .SH "CONVERT OPTIONS"
 .TP
 .BI \-\-out " DIR"

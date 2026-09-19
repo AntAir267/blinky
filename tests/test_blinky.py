@@ -148,7 +148,8 @@ def test_retries(blobs, entries):
 
 def dl_args(out, **kw):
     base = dict(out=out, images=None, force=False, timeout=5000, retries=3,
-                chunk=4096, verbose=False, quiet=True)
+                chunk=4096, verbose=False, quiet=True, format="png",
+                jpeg_quality=92, no_skip_duplicates=False, delete_after=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -194,6 +195,163 @@ def test_download(blobs):
         check("an out-of-range --images is rejected", "out of range" in str(exc))
     shutil.rmtree(tmp)
     shutil.rmtree(tmp2)
+
+
+def test_duplicates_and_formats(blobs):
+    section("duplicate detection by content, and picture formats")
+    tmp = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
+    first = sorted(os.listdir(tmp))
+    check("first run saved everything", len(first) == 3, first)
+
+    # Rename everything: a name-based check would now re-download the lot.
+    for name in os.listdir(tmp):
+        os.rename(os.path.join(tmp, name), os.path.join(tmp, "holiday-" + name))
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    rc, out = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
+                    blinky.RunState())
+    check("renamed copies are still recognised",
+          sorted(os.listdir(tmp)) == sorted("holiday-" + n for n in first),
+          sorted(os.listdir(tmp)))
+    check("and it says so", "already saved as" in out or "skipped" in out, out)
+
+    # A different photo that happens to reuse a filename must not be clobbered.
+    tmp2 = tempfile.mkdtemp()
+    open(os.path.join(tmp2, "image0000.raw"), "wb").write(b"\xff\xd8" + b"different" * 400)
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp2), Log(quiet=True), blinky.RunState())
+    kept = open(os.path.join(tmp2, "image0000.raw"), "rb").read()
+    check("the unrelated file with the same name survived",
+          kept.startswith(b"\xff\xd8different"), kept[:20])
+    check("the real photo landed beside it under a free name",
+          "image0000-1.raw" in os.listdir(tmp2), sorted(os.listdir(tmp2)))
+
+    # --no-skip-duplicates goes back to matching names only.
+    tmp3 = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
+          Log(quiet=True), blinky.RunState())
+    os.rename(os.path.join(tmp3, "image0000.raw"),
+              os.path.join(tmp3, "renamed.raw"))
+    os.rename(os.path.join(tmp3, "image0000.png"),
+              os.path.join(tmp3, "renamed.png"))
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
+          Log(quiet=True), blinky.RunState())
+    check("--no-skip-duplicates re-downloads a renamed photo",
+          "image0000.raw" in os.listdir(tmp3), sorted(os.listdir(tmp3)))
+
+    # Formats.
+    from PIL import Image
+    for fmt, want in [("jpeg", {"image0000.jpg"}), ("both", {"image0000.png", "image0000.jpg"})]:
+        d = tempfile.mkdtemp()
+        cam, sim = make_cam(blobs)
+        blinky.open_camera = lambda a, l: cam
+        quiet(blinky.cmd_download, dl_args(d, format=fmt), Log(quiet=True),
+              blinky.RunState())
+        got = set(os.listdir(d))
+        check("--format %s writes %s" % (fmt, "/".join(sorted(want))),
+              want <= got, sorted(got))
+        if "image0000.jpg" in got:
+            with Image.open(os.path.join(d, "image0000.jpg")) as im:
+                check("  the %s jpeg is 640x480" % fmt, im.size == (640, 480), im.size)
+        shutil.rmtree(d)
+    for d in (tmp, tmp2, tmp3):
+        shutil.rmtree(d)
+
+
+def test_delete_safety(blobs):
+    section("--delete-after refuses unless the camera is provably safe to erase")
+
+    def run(**kw):
+        d = kw.pop("out", None) or tempfile.mkdtemp()
+        cam, sim = make_cam(blobs)
+        blinky.open_camera = lambda a, l: cam
+        log = Log(quiet=True)
+        rc, out = quiet(blinky.cmd_download, dl_args(d, delete_after=True, **kw),
+                        log, blinky.RunState())
+        return rc, out + log.transcript(), sim, d
+
+    rc, out, sim, d = run()
+    check("erases when everything downloaded and verified",
+          sim.blobs == [] and rc == 0, "rc=%d blobs=%d" % (rc, len(sim.blobs)))
+    check("says it verified the files", "verified byte for byte" in out, out)
+    shutil.rmtree(d)
+
+    rc, out, sim, d = run(images="0")
+    check("refuses on a partial selection (erase would destroy the rest)",
+          sim.blobs != [] and rc == 1, "blobs left=%d" % len(sim.blobs))
+    check("explains why", "erasing would destroy" in out, out)
+    shutil.rmtree(d)
+
+    # A transfer failure must block the erase.
+    d = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs, retries=0)
+    sim.truncate_at = 500
+    blinky.open_camera = lambda a, l: cam
+    log = Log(quiet=True)
+    rc, out = quiet(blinky.cmd_download, dl_args(d, delete_after=True),
+                    log, blinky.RunState())
+    out += log.transcript()
+    check("refuses after a failed transfer",
+          sim.blobs != [] and rc == 1, "blobs left=%d" % len(sim.blobs))
+    check("names the failure as the reason", "failed during this run" in out, out)
+    shutil.rmtree(d)
+
+    # If a saved file is tampered with before the verify, it must refuse.
+    d = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    real_verify = blinky.verify_saved
+    blinky.verify_saved = lambda p, b, dg: (False, "simulated mismatch")
+    log = Log(quiet=True)
+    rc, out = quiet(blinky.cmd_download, dl_args(d, delete_after=True),
+                    log, blinky.RunState())
+    out += log.transcript()
+    blinky.verify_saved = real_verify
+    check("refuses when a file does not verify",
+          sim.blobs != [] and rc == 1, "blobs left=%d" % len(sim.blobs))
+    check("names the file", "did not verify" in out, out)
+    shutil.rmtree(d)
+
+
+def test_delete_command(blobs):
+    section("the delete command")
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    a = argparse.Namespace(all=True, last=None, yes=True, timeout=5000,
+                           retries=3, chunk=4096)
+    rc, out = quiet(blinky.cmd_delete, a, Log(quiet=True), blinky.RunState())
+    check("--all --yes erases everything", rc == 0 and sim.blobs == [], out)
+
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    before = len(sim.blobs)
+    a = argparse.Namespace(all=False, last=1, yes=True, timeout=5000,
+                           retries=3, chunk=4096)
+    rc, out = quiet(blinky.cmd_delete, a, Log(quiet=True), blinky.RunState())
+    check("--last 1 removes only the newest",
+          rc == 0 and len(sim.blobs) == before - 1, len(sim.blobs))
+
+    # Without --yes and with no terminal, it must refuse rather than guess.
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    a = argparse.Namespace(all=True, last=None, yes=False, timeout=5000,
+                           retries=3, chunk=4096)
+    rc, out = quiet(blinky.cmd_delete, a, Log(quiet=True), blinky.RunState())
+    check("refuses unconfirmed when stdin is not a terminal",
+          rc == 1 and sim.blobs != [], "rc=%d blobs=%d" % (rc, len(sim.blobs)))
+
+    check("prefix reads are cheap and correct",
+          cam.read_prefix(blinky.DirEntry(0, sim.starts[0],
+                                          sim.starts[0] + len(sim.blobs[0][0]) // 2, 0),
+                          64) == sim.blobs[0][0][:64])
 
 
 def test_list(blobs):
@@ -264,7 +422,8 @@ def test_decode_command():
     tmp = tempfile.mkdtemp()
     raw = os.path.join(tmp, "image0009.raw")
     open(raw, "wb").write(make_jpeg())
-    a = argparse.Namespace(files=[raw], out=tmp, force=False)
+    a = argparse.Namespace(files=[raw], out=tmp, force=False, format="png",
+                           jpeg_quality=92)
     rc, _ = quiet(blinky.cmd_decode, a, Log(quiet=True), blinky.RunState())
     check("exit 0", rc == 0)
     from PIL import Image
@@ -275,7 +434,8 @@ def test_decode_command():
     bogus = os.path.join(tmp, "bogus.raw")
     open(bogus, "wb").write(os.urandom(500))
     rc, _ = quiet(blinky.cmd_decode,
-                  argparse.Namespace(files=[bogus], out=tmp, force=False),
+                  argparse.Namespace(files=[bogus], out=tmp, force=False,
+                                     format="png", jpeg_quality=92),
                   Log(quiet=True), blinky.RunState())
     check("non-JPEG data fails cleanly", rc == 1)
     shutil.rmtree(tmp)
@@ -346,7 +506,11 @@ def test_doctor(blobs):
         results, cam = blinky.run_checks(Log(quiet=True))
         r = results[1]
         check("stops at check 2", len(results) == 2 and not r.ok, len(results))
-        check("names the rule file", blinky.UDEV_RULE_PATH in (r.fix or ""))
+        # It should name whichever rule path it actually found, which differs
+        # between a packaged install (/usr/lib) and a hand-written one (/etc).
+        check("names a real rule path",
+              any(path in (r.fix or "") for path in blinky.UDEV_RULE_PATHS),
+              r.fix)
 
         section("doctor: check 4 on a short handshake")
         cam, sim = install()
@@ -392,6 +556,70 @@ def test_doctor(blobs):
         restore()
 
 
+def test_gui_erase_path(blobs):
+    """The window must not invent its own erase rules."""
+    section("GUI: erase-after-download delegates to the tested safety check")
+    try:
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication, QDialog
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+
+    app = QApplication.instance() or QApplication([])
+    blinky_gui.BlinkyWindow.refresh = lambda self: None
+    w = blinky_gui.BlinkyWindow()
+    w.outdir = tempfile.mkdtemp()
+
+    cam, sim = make_cam(blobs)
+    entries, _, _ = cam.get_directory()
+    w.entries = entries
+    w._rebuild_rows()
+
+    calls = []
+    real_delete = blinky._delete_after_download
+    blinky._delete_after_download = lambda *a, **k: (calls.append(a), 0)[1]
+    real_open = blinky.Blink2.open
+    blinky.Blink2.open = lambda self, handshake=True: (
+        setattr(self, "dev", cam.dev), setattr(self, "in_ep", cam.in_ep),
+        setattr(self, "max_packet", 64), self)[-1]
+
+    # Unticked: the erase path must not run at all.
+    w.eraseafter.setChecked(False)
+    w.download()
+    w.job.wait(20000)
+    app.processEvents()
+    check("no erase when the box is unticked", calls == [], calls)
+
+    # Ticked but the confirmation declined: still nothing.
+    shutil.rmtree(w.outdir, ignore_errors=True)
+    w.outdir = tempfile.mkdtemp()
+    w.eraseafter.setChecked(True)
+    w._confirm_erase = lambda n: False
+    w.download()
+    app.processEvents()
+    check("declining the confirmation downloads nothing", calls == [], calls)
+
+    # Ticked and confirmed: it must hand off to the shared safety check.
+    w._confirm_erase = lambda n: True
+    w.download()
+    w.job.wait(20000)
+    app.processEvents()
+    check("confirmed erase calls the shared safety check", len(calls) == 1,
+          calls)
+    if calls:
+        passed_entries, passed_wanted = calls[0][2], calls[0][3]
+        check("  it is told about every photo, not a subset",
+              list(passed_wanted) == list(range(len(entries))), passed_wanted)
+        check("  and the full entry list", len(passed_entries) == len(entries))
+
+    blinky._delete_after_download = real_delete
+    blinky.Blink2.open = real_open
+    shutil.rmtree(w.outdir, ignore_errors=True)
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -429,9 +657,13 @@ def main():
     entries = test_protocol(blobs)
     test_retries(blobs, entries)
     test_download(blobs)
+    test_duplicates_and_formats(blobs)
+    test_delete_safety(blobs)
+    test_delete_command(blobs)
     test_list(blobs)
     test_decode_command()
     test_doctor(blobs)
+    test_gui_erase_path(blobs)
     test_misc()
 
     print("\n%s" % ("-" * 60))

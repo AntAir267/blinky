@@ -21,6 +21,7 @@ Protocol notes (blink2.c / blink2.txt):
 import argparse
 import datetime
 import errno
+import hashlib
 import os
 import re
 import shutil
@@ -41,7 +42,14 @@ REQ_INIT_STILL = 0x04           # -> 1 byte   (camera_init, after firmware id)
 REQ_GET_NUMPICS = 0x08          # -> 2 bytes  big-endian
 REQ_GET_MEMORY = 0x0A           # <- 8 bytes  (start BE32, len BE32), then bulk
 REQ_GET_DIR = 0x0D              # -> 1 byte, then bulk
+REQ_DELETE_LAST = 0x11          # -> 1 byte   destroys the newest image
+REQ_DELETE_ALL = 0x12           # -> 1 byte   destroys everything
 REQ_GET_FIRMWARE_ID = 0x18      # -> 6 bytes
+
+# How many bytes of an image to read when fingerprinting it. The camera
+# honours a short length on GET_MEMORY, so this costs about 30ms instead of
+# the seconds a whole image takes.
+FINGERPRINT_BYTES = 4096
 
 WVALUE = 0x03
 WINDEX = 0x00
@@ -777,6 +785,47 @@ class Blink2:
                 % (len(data), entry.data_bytes, entry.basename))
         return data
 
+    def read_prefix(self, entry, nbytes=FINGERPRINT_BYTES):
+        """Read only the first `nbytes` of an image.
+
+        GET_MEMORY takes a length, so a short request returns a short answer;
+        verified against hardware as byte-identical to the head of the full
+        image, with nothing left queued on the endpoint afterwards.
+        """
+        nbytes = min(nbytes, entry.data_bytes)
+        words = nbytes // 8
+        if words == 0:
+            return b""
+        payload = entry.start.to_bytes(4, "big") + words.to_bytes(4, "big")
+        self.ctrl_write(REQ_GET_MEMORY, payload)
+        data = self.bulk_read(words * 8, what="%s prefix" % entry.basename)
+        if len(data) < words * 8:
+            raise CameraError(
+                "short prefix read for %s: got %d of %d bytes"
+                % (entry.basename, len(data), words * 8))
+        return data
+
+    def fingerprint(self, entry, nbytes=FINGERPRINT_BYTES):
+        """(size, digest-of-prefix) identifying this image's content."""
+        return entry.data_bytes, hashlib.sha256(
+            self.read_prefix(entry, nbytes)).hexdigest()
+
+    def delete_all(self):
+        """Erase every image. There is no undo and no per-image delete."""
+        data = self.ctrl_read(REQ_DELETE_ALL, 1)
+        if len(data) != 1:
+            raise CameraError("delete-all returned %d bytes, expected 1"
+                              % len(data))
+        return data
+
+    def delete_last(self):
+        """Erase the newest image only."""
+        data = self.ctrl_read(REQ_DELETE_LAST, 1)
+        if len(data) != 1:
+            raise CameraError("delete-last returned %d bytes, expected 1"
+                              % len(data))
+        return data
+
     def read_image_with_retries(self, entry, retries=None):
         """Fetch one image, re-issuing the whole request on failure."""
         attempts = (self.retries if retries is None else retries) + 1
@@ -919,6 +968,33 @@ def write_png(path, width, height, raster):
     Image = _import_pil()
     img = Image.frombytes("RGB", (width, height), raster)
     img.save(path, "PNG", optimize=True)
+
+
+def write_jpeg(path, width, height, raster, quality=92):
+    """Re-encode the decoded pixels as JPEG.
+
+    Worth knowing: the camera's own data is already JPEG, so this is a second
+    lossy pass over lossy data. PNG is the lossless default for that reason.
+    The .raw file blinky keeps is the camera's original JPEG bitstream, and
+    opens in any viewer as the 640x240 interleaved frame.
+    """
+    Image = _import_pil()
+    img = Image.frombytes("RGB", (width, height), raster)
+    img.save(path, "JPEG", quality=quality, subsampling=0, optimize=True)
+
+
+def write_still(outdir, basename, width, height, raster, fmt, quality):
+    """Write the decoded still in the requested format(s). Returns paths."""
+    written = []
+    if fmt in ("png", "both"):
+        path = os.path.join(outdir, basename + ".png")
+        write_png(path, width, height, raster)
+        written.append(path)
+    if fmt in ("jpeg", "both"):
+        path = os.path.join(outdir, basename + ".jpg")
+        write_jpeg(path, width, height, raster, quality)
+        written.append(path)
+    return written
 
 
 # ---------------------------------------------------------------------------
@@ -1540,6 +1616,45 @@ def parse_image_spec(spec, count):
     return out
 
 
+def local_fingerprints(outdir, nbytes=FINGERPRINT_BYTES):
+    """Index what is already in a folder, by content rather than by name.
+
+    Returns {(size, digest): path}. The .raw and .avi files blinky writes are
+    the camera's exact bytes, so their prefixes hash to the same value as the
+    camera's own -- which means a photo can be recognised after it has been
+    renamed or moved, and a different photo that merely reuses a filename is
+    not mistaken for it.
+    """
+    index = {}
+    try:
+        names = sorted(os.listdir(outdir))
+    except OSError:
+        return index
+    for name in names:
+        if not name.lower().endswith((".raw", ".avi")):
+            continue
+        path = os.path.join(outdir, name)
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as fh:
+                head = fh.read(nbytes)
+        except OSError:
+            continue
+        index.setdefault((size, hashlib.sha256(head).hexdigest()), path)
+    return index
+
+
+def free_path(path):
+    """A path that does not exist yet, by adding -1, -2 ... before the suffix."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists("%s-%d%s" % (stem, n, ext)):
+        n += 1
+    return "%s-%d%s" % (stem, n, ext)
+
+
 def write_file_atomically(path, data):
     tmp = path + ".part"
     try:
@@ -1644,6 +1759,21 @@ def cmd_list(args, log, state):
             cam.close()
 
 
+def verify_saved(path, expected_bytes, expected_digest):
+    """Re-read a file from disk and confirm it is what we just transferred."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError as exc:
+        return False, "could not read it back: %s" % exc
+    if size != expected_bytes:
+        return False, "on disk it is %d bytes, expected %d" % (size, expected_bytes)
+    if digest != expected_digest:
+        return False, "its contents do not match what was transferred"
+    return True, ""
+
+
 def cmd_download(args, log, state):
     since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
     outdir = os.path.expanduser(args.out)
@@ -1653,6 +1783,7 @@ def cmd_download(args, log, state):
     partials = []
     saved = []
     skipped = []
+    verified = {}          # entry index -> (path, bytes, digest)
     try:
         cam = open_camera(args, log)
         numpics = cam.get_numpics()
@@ -1667,25 +1798,57 @@ def cmd_download(args, log, state):
                 % (len(wanted), len(entries), outdir))
         log.out("")
 
-        for index in wanted:
-            entry = entries[index]
+        index = {} if args.no_skip_duplicates else local_fingerprints(outdir)
+        if index:
+            log.debug("%d file(s) already in %s are indexed by content"
+                      % (len(index), outdir))
+        sizes_present = {size for size, _ in index}
+
+        for i in wanted:
+            entry = entries[i]
+
+            # Content-based skip: only pay for the prefix read when some local
+            # file is the right size to be this photo in the first place.
+            if index and entry.data_bytes in sizes_present and not args.force:
+                try:
+                    key = cam.fingerprint(entry)
+                except CameraError as exc:
+                    log.warn("could not fingerprint %s (%s); downloading it"
+                             % (entry.basename, exc))
+                    key = None
+                if key in index:
+                    log.info("  %s: already saved as %s"
+                             % (entry.basename,
+                                os.path.basename(index[key])))
+                    skipped.append(entry.basename)
+                    continue
+
             if entry.is_movie:
-                # A clip needs no decoding, so the .avi *is* the raw save.
-                targets = [os.path.join(outdir, entry.basename + ".avi")]
-                raw_path = targets[0]
-                png_path = None
+                # A clip needs no decoding, so the .avi is the raw save.
+                raw_path = os.path.join(outdir, entry.basename + ".avi")
+                targets = [raw_path]
             else:
                 raw_path = os.path.join(outdir, entry.basename + ".raw")
-                png_path = os.path.join(outdir, entry.basename + ".png")
-                targets = [raw_path, png_path]
+                targets = [raw_path] + [
+                    os.path.join(outdir, entry.basename + ext)
+                    for ext in ((".png",) if args.format == "png"
+                                else (".jpg",) if args.format == "jpeg"
+                                else (".png", ".jpg"))]
 
             existing = [t for t in targets if os.path.exists(t)]
             if existing and not args.force:
-                log.info("  %s: skipped, %s already exists (use --force "
-                         "to re-download)"
-                         % (entry.basename, os.path.basename(existing[0])))
-                skipped.append(entry.basename)
-                continue
+                if args.no_skip_duplicates:
+                    log.info("  %s: skipped, %s already exists (use --force "
+                             "to re-download)"
+                             % (entry.basename, os.path.basename(existing[0])))
+                    skipped.append(entry.basename)
+                    continue
+                # Content said this is a photo we do not have, but the name is
+                # taken by a different one. Never clobber it.
+                raw_path = free_path(raw_path)
+                log.info("  %s: %s is a different photo, saving as %s"
+                         % (entry.basename, os.path.basename(existing[0]),
+                            os.path.basename(raw_path)))
 
             log.info("  %s: %s, %d bytes"
                      % (entry.basename, "AVI clip" if entry.is_movie else "still",
@@ -1693,7 +1856,7 @@ def cmd_download(args, log, state):
             t0 = time.monotonic()
             try:
                 data = cam.read_image_with_retries(entry)
-            except (PermissionDenied, NotPresent) as exc:
+            except (PermissionDenied, NotPresent, DeviceStalled) as exc:
                 explain_camera_error(log, exc, since)
                 failures.append((entry.basename, str(exc)))
                 log.error("aborting: the device is no longer usable")
@@ -1712,16 +1875,20 @@ def cmd_download(args, log, state):
             write_file_atomically(raw_path, data)
             log.info("    saved raw -> %s" % raw_path)
             saved.append(raw_path)
+            verified[i] = (raw_path, len(data),
+                           hashlib.sha256(data).hexdigest())
 
-            if png_path is None:
+            if entry.is_movie:
                 continue
+            stem = os.path.splitext(os.path.basename(raw_path))[0]
             try:
                 width, height, raster, partial = decode_still(data, log)
-                write_png(png_path, width, height, raster)
-                log.info("    decoded %dx%d%s -> %s"
-                         % (width, height, " (partial)" if partial else "",
-                            png_path))
-                saved.append(png_path)
+                for path in write_still(outdir, stem, width, height, raster,
+                                        args.format, args.jpeg_quality):
+                    log.info("    decoded %dx%d%s -> %s"
+                             % (width, height, " (partial)" if partial else "",
+                                path))
+                    saved.append(path)
                 if partial:
                     partials.append(entry.basename)
             except CameraError as exc:
@@ -1730,6 +1897,12 @@ def cmd_download(args, log, state):
                          "'blinky decode %s' once the cause is known"
                          % (raw_path, raw_path))
                 failures.append((entry.basename, "decode: %s" % exc))
+
+        if args.delete_after:
+            rc = _delete_after_download(cam, log, entries, wanted, verified,
+                                        failures, skipped)
+            if rc:
+                failures.append(("delete", "refused; see above"))
     except CameraError as exc:
         explain_camera_error(log, exc, since)
         return 1
@@ -1744,10 +1917,138 @@ def cmd_download(args, log, state):
     for name, why in failures:
         log.out("  failed: %s -- %s" % (name, why))
     for name in partials:
-        log.out("  partial: %s -- the JPEG in the camera is damaged; the PNG "
-                "holds the rows that decoded, and the .raw holds the exact "
-                "bytes" % name)
+        log.out("  partial: %s -- the JPEG in the camera is damaged; the "
+                "picture holds the rows that decoded, and the .raw holds the "
+                "exact bytes" % name)
     return 1 if failures else 0
+
+
+def _delete_after_download(cam, log, entries, wanted, verified, failures,
+                           skipped):
+    """Erase the camera, but only when that is provably safe.
+
+    The camera can only erase *everything*: there is no per-image delete in
+    the protocol. So anything short of "every photo on the camera is now
+    safely on disk" means refusing, because the alternative is destroying a
+    photo that was never copied.
+    """
+    log.out("")
+    log.out("--delete-after: checking it is safe to erase the camera")
+
+    def refuse(reason):
+        log.error("refusing to erase the camera: %s" % reason)
+        log.info("  The camera has no per-image delete; erasing removes "
+                 "everything, so blinky only does it when every photo is "
+                 "accounted for on disk.")
+        return 1
+
+    if failures:
+        return refuse("%d image(s) failed during this run" % len(failures))
+    if len(wanted) != len(entries):
+        return refuse("only %d of %d photos were selected (--images), and "
+                      "erasing would destroy the other %d"
+                      % (len(wanted), len(entries), len(entries) - len(wanted)))
+
+    # Every photo must be on disk: either saved now, or skipped because an
+    # identical copy was already there.
+    unaccounted = [entries[i].basename for i in wanted
+                   if i not in verified and entries[i].basename not in skipped]
+    if unaccounted:
+        return refuse("no verified copy of %s" % ", ".join(unaccounted[:5]))
+
+    # Re-read from disk what we just wrote and check it byte for byte.
+    for i, (path, size, digest) in sorted(verified.items()):
+        ok, why = verify_saved(path, size, digest)
+        if not ok:
+            return refuse("%s did not verify: %s" % (os.path.basename(path), why))
+    log.out("  %d file(s) re-read from disk and verified byte for byte"
+            % len(verified))
+    if skipped:
+        log.out("  %d photo(s) were already saved from a previous run"
+                % len(skipped))
+
+    log.out("  erasing the camera")
+    cam.delete_all()
+    time.sleep(0.6)
+    left = cam.get_numpics()
+    if left:
+        log.warn("the camera still reports %d photo(s) after the erase" % left)
+        return 1
+    log.out("  the camera is now empty")
+    return 0
+
+
+def cmd_delete(args, log, state):
+    """Erase the camera. Destructive, irreversible, and always confirmed."""
+    since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
+    cam = None
+    try:
+        cam = open_camera(args, log)
+        numpics = cam.get_numpics()
+        if numpics == 0:
+            log.out("The camera is already empty.")
+            return 0
+        entries, _, _ = cam.get_directory(numpics)
+
+        if args.last:
+            doomed = entries[-args.last:]
+            what = ("the newest photo" if args.last == 1
+                    else "the %d newest photos" % args.last)
+        else:
+            doomed = entries
+            what = "all %d photos" % numpics
+
+        log.out("This will erase %s from the camera:" % what)
+        for e in doomed:
+            log.out("    %s  %s  %d bytes"
+                    % (e.basename, "AVI" if e.is_movie else "still",
+                       e.data_bytes))
+        log.out("")
+        log.out("The camera has no undo. Anything not already downloaded is "
+                "gone for good.")
+
+        if not args.yes:
+            if not sys.stdin.isatty():
+                log.error("refusing to erase without confirmation; pass --yes "
+                          "if you really mean it")
+                return 1
+            try:
+                reply = input("Type 'erase' to go ahead: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                log.out("")
+                log.out("Cancelled; nothing was erased.")
+                return 1
+            if reply != "erase":
+                log.out("Cancelled; nothing was erased.")
+                return 1
+
+        if args.last:
+            # The protocol can only pop the newest image, one at a time.
+            for n in range(args.last):
+                cam.delete_last()
+                time.sleep(0.4)
+            left = cam.get_numpics()
+            log.out("Erased %d; %d photo(s) left on the camera."
+                    % (args.last, left))
+            if left != numpics - args.last:
+                log.warn("expected %d left, the camera reports %d"
+                         % (numpics - args.last, left))
+                return 1
+        else:
+            cam.delete_all()
+            time.sleep(0.6)
+            left = cam.get_numpics()
+            if left:
+                log.warn("the camera still reports %d photo(s)" % left)
+                return 1
+            log.out("The camera is now empty.")
+        return 0
+    except CameraError as exc:
+        explain_camera_error(log, exc, since)
+        return 1
+    finally:
+        if cam is not None:
+            cam.close()
 
 
 def cmd_decode(args, log, state):
@@ -1764,18 +2065,22 @@ def cmd_decode(args, log, state):
             continue
         base = os.path.splitext(os.path.basename(path))[0]
         target_dir = outdir or os.path.dirname(os.path.abspath(path))
-        png_path = os.path.join(target_dir, base + ".png")
-        if os.path.exists(png_path) and not args.force:
-            log.out("%s: skipped, %s already exists" % (path, png_path))
+        exts = ((".png",) if args.format == "png"
+                else (".jpg",) if args.format == "jpeg" else (".png", ".jpg"))
+        existing = [os.path.join(target_dir, base + e) for e in exts
+                    if os.path.exists(os.path.join(target_dir, base + e))]
+        if existing and not args.force:
+            log.out("%s: skipped, %s already exists" % (path, existing[0]))
             skipped += 1
             continue
         try:
             with open(path, "rb") as fh:
                 data = fh.read()
             width, height, raster, partial = decode_still(data, log)
-            write_png(png_path, width, height, raster)
+            written = write_still(target_dir, base, width, height, raster,
+                                  args.format, args.jpeg_quality)
             log.out("%s -> %s  (%dx%d%s)"
-                    % (path, png_path, width, height,
+                    % (path, ", ".join(written), width, height,
                        ", partial: the JPEG is damaged" if partial else ""))
             done += 1
         except (CameraError, OSError) as exc:
@@ -1933,6 +2238,18 @@ def add_common_options(parser):
     return parser
 
 
+def add_format_options(parser):
+    parser.add_argument("--format", choices=("png", "jpeg", "both"),
+                        default="png",
+                        help="picture format for stills (default png). The "
+                             "camera's data is already JPEG, so png is "
+                             "lossless from the decoded pixels while jpeg "
+                             "re-encodes them a second time")
+    parser.add_argument("--jpeg-quality", type=int, default=92, metavar="N",
+                        help="JPEG quality 1-100 (default 92)")
+    return parser
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="blinky",
@@ -1945,6 +2262,9 @@ examples:
   blinky list                       show what is on the camera
   blinky download                   fetch everything to ~/blink-pics
   blinky download --images 0,2-3    fetch selected photos
+  blinky download --format both     save PNG and JPEG
+  blinky download --delete-after    fetch everything, verify, then erase
+  blinky delete --last 1            erase just the newest photo
   blinky decode ~/blink-pics/image0000.raw
   blinky convert ~/blink-pics       batch .pnm -> .png, originals kept
 
@@ -1973,14 +2293,35 @@ imageNNNN.avi is itself the untouched raw data.
                    help="which photos, e.g. 0,2-4 (default: all)")
     p.add_argument("--force", action="store_true",
                    help="re-download and overwrite existing files")
+    add_format_options(p)
+    p.add_argument("--no-skip-duplicates", action="store_true",
+                   help="do not check whether a photo is already in the "
+                        "output folder by content; fall back to matching "
+                        "filenames only")
+    p.add_argument("--delete-after", action="store_true",
+                   help="erase the camera once every photo is downloaded and "
+                        "verified on disk (refused if anything failed, or if "
+                        "--images selected only some of them)")
     p.set_defaults(func=cmd_download)
 
     p = add_common_options(sub.add_parser(
-        "decode", help="decode saved .raw files to PNG"))
+        "delete", help="erase photos from the camera"))
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--all", action="store_true",
+                   help="erase every photo (the default)")
+    g.add_argument("--last", type=int, metavar="N",
+                   help="erase only the N newest photos")
+    p.add_argument("--yes", action="store_true",
+                   help="skip the confirmation prompt")
+    p.set_defaults(func=cmd_delete)
+
+    p = add_common_options(sub.add_parser(
+        "decode", help="decode saved .raw files to PNG or JPEG"))
     p.add_argument("files", nargs="+", metavar="RAW")
     p.add_argument("--out", metavar="DIR", help="output directory")
     p.add_argument("--force", action="store_true",
-                   help="overwrite existing PNGs")
+                   help="overwrite existing pictures")
+    add_format_options(p)
     p.set_defaults(func=cmd_decode)
 
     p = add_common_options(sub.add_parser(
@@ -2008,6 +2349,10 @@ def main(argv=None):
         return 2
     if args.timeout <= 0 or args.chunk <= 0 or args.retries < 0:
         parser.error("--timeout and --chunk must be positive, --retries >= 0")
+    if getattr(args, "jpeg_quality", 92) not in range(1, 101):
+        parser.error("--jpeg-quality must be between 1 and 100")
+    if getattr(args, "last", None) is not None and args.last < 1:
+        parser.error("--last must be 1 or more")
 
     log = Log(verbose=args.verbose, quiet=args.quiet)
     state = RunState()

@@ -41,13 +41,21 @@ class FakeDev:
                 n = len(c.blobs); return array.array('B', bytes([n >> 8, n & 0xff]))
             if req == blinky.REQ_GET_DIR:
                 c.pending, c.served = c.table, 0; return array.array('B', b'\x00')
+            if req == blinky.REQ_DELETE_ALL:
+                c.blobs = []; c.rebuild(); return array.array('B', b'\x01')
+            if req == blinky.REQ_DELETE_LAST:
+                if c.blobs: c.blobs = c.blobs[:-1]
+                c.rebuild(); return array.array('B', b'\x01')
             raise AssertionError("unexpected control read 0x%02x" % req)
         if rt == blinky.CTRL_OUT and req == blinky.REQ_GET_MEMORY:
             b = bytes(data)
             start = int.from_bytes(b[0:4], 'big'); ln = int.from_bytes(b[4:8], 'big')
             idx = c.starts.index(start)
-            assert ln * 8 == len(c.blobs[idx][0]), "length mismatch for image %d" % idx
-            c.pending, c.served = c.blobs[idx][0], 0
+            full = c.blobs[idx][0]
+            # A short length asks for a prefix, exactly as the hardware does.
+            want = ln * 8
+            assert want <= len(full), "over-long request for image %d" % idx
+            c.pending, c.served = full[:want], 0
             return 8
         raise AssertionError("unexpected control transfer")
 
@@ -58,17 +66,21 @@ class SimCam:
         self.fail_reads = 0
         self.truncate_at = None
         self.pending, self.served = b'', 0
+        self.rebuild()
+
+    def rebuild(self):
+        """Recompute the directory table, e.g. after a delete."""
         addr, self.starts = 0x001000, []
         ends = []
-        for data, _ in blobs:
+        for data, _ in self.blobs:
             assert len(data) % 8 == 0
             self.starts.append(addr); addr += len(data) // 2; ends.append(addr)
-        n = len(blobs)
+        n = len(self.blobs)
         t = bytearray(8 * (n + 1))
         for i in range(n):
             t[8*i+5:8*i+8] = self.starts[i].to_bytes(3, 'big')
             t[8*(i+1)+5:8*(i+1)+8] = ends[i].to_bytes(3, 'big')
-            t[8*(i+1)] = 1 if blobs[i][1] else 0
+            t[8*(i+1)] = 1 if self.blobs[i][1] else 0
         self.table = bytes(t)
 
 def make_cam(blobs, log=None, **kw):
