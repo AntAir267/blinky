@@ -35,7 +35,17 @@ jobs:
           sudo apt-get update && sudo apt-get install -y python3-pil
           dpkg-deb -c packaging/blinky_*.deb
           mkdir -p /tmp/root && dpkg-deb -x packaging/blinky_*.deb /tmp/root
+          # The launchers are thin wrappers around the installed modules, so
+          # running them out of an unpacked tree needs the module path.
+          export PYTHONPATH=/tmp/root/usr/lib/python3/dist-packages
           /tmp/root/usr/bin/blinky --version
+          /tmp/root/usr/bin/blinky convert --help > /dev/null
+          # blinky-gui must fail with advice, not a traceback, when PyQt6 is absent.
+          if /tmp/root/usr/bin/blinky-gui 2>&1 | grep -q "needs PyQt6"; then
+            echo "blinky-gui degrades cleanly without PyQt6"
+          else
+            echo "blinky-gui did not give the expected message" >&2; exit 1
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: blinky-deb
