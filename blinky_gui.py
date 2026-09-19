@@ -971,14 +971,19 @@ class PhotoRow(QWidget):
     def _thumb(self):
         if not self.saved_path:
             return None
-        stem = os.path.splitext(self.saved_path)[0]
-        for ext in (".png", ".jpg"):
-            path = stem + ext
-            if os.path.exists(path):
-                pm = QPixmap(path)
-                if not pm.isNull():
-                    return pm.scaled(44, 33, Qt.AspectRatioMode.KeepAspectRatio,
-                                     Qt.TransformationMode.SmoothTransformation)
+        base = os.path.splitext(os.path.basename(self.saved_path))[0]
+        here = os.path.dirname(self.saved_path)
+        # The picture sits beside the raw, or one level up when raws are
+        # kept in a raw/ subfolder.
+        for folder in (here, os.path.dirname(here)):
+            for ext in (".png", ".jpg"):
+                path = os.path.join(folder, base + ext)
+                if os.path.exists(path):
+                    pm = QPixmap(path)
+                    if not pm.isNull():
+                        return pm.scaled(
+                            44, 33, Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation)
         return None
 
     def paintEvent(self, _):
@@ -1166,8 +1171,8 @@ class BlinkyWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMinimumSize(600, 760)
-        self.resize(600, 800)
+        self.setMinimumSize(600, 780)
+        self.resize(600, 820)
 
         self.outdir = blinky.DEFAULT_OUTDIR
         self.entries = []
@@ -1299,6 +1304,10 @@ class BlinkyWindow(QWidget):
         self.skipdupes = AquaCheck(
             "Skip photos already in this folder, even if renamed", True, self)
         opts.addWidget(self.skipdupes)
+        self.rawsub = AquaCheck(
+            "Keep raw camera files in a raw/ subfolder", True, self)
+        self.rawsub.toggled.connect(lambda _: self._rebuild_rows())
+        opts.addWidget(self.rawsub)
         self.eraseafter = AquaCheck(
             "Erase the camera after downloading", False, self, tint="warn")
         self.eraseafter.toggled.connect(self._erase_toggled)
@@ -1613,9 +1622,11 @@ class BlinkyWindow(QWidget):
         entries, outdir = list(self.entries), self.outdir
         fmt, quality = self.fmt.value(), 92
         skip_dupes = self.skipdupes.isChecked()
+        rawdir = blinky.raw_dir(outdir, self.rawsub.isChecked())
 
         def work(job, log):
             os.makedirs(outdir, exist_ok=True)
+            os.makedirs(rawdir, exist_ok=True)
             cam = blinky.Blink2(log)
             cam.open()
             saved = failed = partial = 0
@@ -1676,7 +1687,7 @@ class BlinkyWindow(QWidget):
                     # free_path is a belt-and-braces guard: the counter should
                     # already be past anything on disk, but overwriting a
                     # photo is not a mistake worth risking.
-                    raw = blinky.free_path(os.path.join(outdir, stem + ".raw"))
+                    raw = blinky.free_path(os.path.join(rawdir, stem + ".raw"))
                     stem = os.path.splitext(os.path.basename(raw))[0]
                     blinky.write_file_atomically(raw, data)
                     paths[i] = raw

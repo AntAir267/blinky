@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.2"
+__version__ = "1.3"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -61,7 +61,45 @@ CTRL_OUT = 0x40                 # LIBUSB_REQUEST_TYPE_VENDOR|RECIPIENT_DEVICE
 DEFAULT_TIMEOUT_MS = 5000
 DEFAULT_CHUNK = 4096
 DEFAULT_RETRIES = 3
-DEFAULT_OUTDIR = os.path.expanduser("~/blink-pics")
+RAW_SUBDIR = "raw"
+
+
+def _pictures_dir():
+    """The user's Pictures folder, honouring XDG (and its localised names)."""
+    env = os.environ.get("XDG_PICTURES_DIR")
+    if env:
+        return os.path.expandvars(os.path.expanduser(env))
+    config = os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "user-dirs.dirs")
+    try:
+        with open(config) as fh:
+            for line in fh:
+                if line.startswith("XDG_PICTURES_DIR"):
+                    value = line.split("=", 1)[1].strip().strip('"')
+                    value = value.replace("$HOME", os.path.expanduser("~"))
+                    if value:
+                        return os.path.expanduser(value)
+    except OSError:
+        pass
+    return os.path.expanduser("~/Pictures")
+
+
+DEFAULT_OUTDIR = os.path.join(_pictures_dir(), "blink-pics")
+
+
+def raw_dir(outdir, use_subfolder=True):
+    """Where the camera's untouched bytes go."""
+    return os.path.join(outdir, RAW_SUBDIR) if use_subfolder else outdir
+
+
+def scan_dirs(outdir):
+    """The folder and its raw/ subfolder: both hold files we may already have."""
+    dirs = [outdir]
+    sub = os.path.join(outdir, RAW_SUBDIR)
+    if os.path.isdir(sub):
+        dirs.append(sub)
+    return dirs
 # Debian convention: package-shipped udev rules live under /usr/lib, and
 # /etc/udev/rules.d is reserved for local overrides. Look in both, because the
 # rule may have come from the blinky package or been written by hand.
@@ -1633,21 +1671,22 @@ def local_fingerprints(outdir, nbytes=FINGERPRINT_BYTES):
     not mistaken for it.
     """
     index = {}
-    try:
-        names = sorted(os.listdir(outdir))
-    except OSError:
-        return index
-    for name in names:
-        if not name.lower().endswith((".raw", ".avi")):
-            continue
-        path = os.path.join(outdir, name)
+    for folder in scan_dirs(outdir):
         try:
-            size = os.path.getsize(path)
-            with open(path, "rb") as fh:
-                head = fh.read(nbytes)
+            names = sorted(os.listdir(folder))
         except OSError:
             continue
-        index.setdefault((size, hashlib.sha256(head).hexdigest()), path)
+        for name in names:
+            if not name.lower().endswith((".raw", ".avi")):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                size = os.path.getsize(path)
+                with open(path, "rb") as fh:
+                    head = fh.read(nbytes)
+            except OSError:
+                continue
+            index.setdefault((size, hashlib.sha256(head).hexdigest()), path)
     return index
 
 
@@ -1664,17 +1703,18 @@ def next_free_index(outdir):
     avoids the confusing image0000-1 pile-up that suffixing produces.
     """
     highest = -1
-    try:
-        names = os.listdir(outdir)
-    except OSError:
-        return 0
-    for name in names:
-        m = IMAGE_NAME_RE.match(name)
-        if m:
-            try:
-                highest = max(highest, int(m.group(1)))
-            except ValueError:
-                pass
+    for folder in scan_dirs(outdir):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            m = IMAGE_NAME_RE.match(name)
+            if m:
+                try:
+                    highest = max(highest, int(m.group(1)))
+                except ValueError:
+                    pass
     return highest + 1
 
 
@@ -1812,6 +1852,7 @@ def cmd_download(args, log, state):
     since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
     outdir = os.path.expanduser(args.out)
     os.makedirs(outdir, exist_ok=True)
+    rawdir = raw_dir(outdir, not args.no_raw_subfolder)
     cam = None
     failures = []
     partials = []
@@ -1872,11 +1913,12 @@ def cmd_download(args, log, state):
                     else (".jpg",) if args.format == "jpeg"
                     else (".png", ".jpg"))
             if entry.is_movie:
-                # A clip needs no decoding, so the .avi is the raw save.
+                # A clip needs no decoding, so the .avi is both the raw save
+                # and the thing you watch: it stays with the pictures.
                 raw_path = os.path.join(outdir, stem + ".avi")
                 targets = [raw_path]
             else:
-                raw_path = os.path.join(outdir, stem + ".raw")
+                raw_path = os.path.join(rawdir, stem + ".raw")
                 targets = [raw_path] + [os.path.join(outdir, stem + e)
                                         for e in exts]
 
@@ -1922,6 +1964,7 @@ def cmd_download(args, log, state):
                         len(data) / 1024.0 / elapsed if elapsed else 0.0))
 
             # Raw bytes hit the disk before anything tries to interpret them.
+            os.makedirs(os.path.dirname(raw_path) or ".", exist_ok=True)
             write_file_atomically(raw_path, data)
             log.info("    saved raw -> %s" % raw_path)
             saved.append(raw_path)
@@ -1961,6 +2004,8 @@ def cmd_download(args, log, state):
             cam.close()
 
     log.out("")
+    if saved and rawdir != outdir:
+        log.out("Raw camera data is in %s" % rawdir)
     log.out("Done: %d file(s) written, %d skipped, %d failed%s."
             % (len(saved), len(skipped), len(failures),
                ", %d partial" % len(partials) if partials else ""))
@@ -2485,6 +2530,9 @@ imageNNNN.avi is itself the untouched raw data.
     p.add_argument("--force", action="store_true",
                    help="re-download and overwrite existing files")
     add_format_options(p)
+    p.add_argument("--no-raw-subfolder", action="store_true",
+                   help="keep the .raw files beside the pictures instead of "
+                        "in a raw/ subfolder")
     p.add_argument("--naming", choices=("continue", "camera"),
                    default="continue",
                    help="'continue' (default) numbers new photos on from the "

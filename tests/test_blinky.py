@@ -150,9 +150,22 @@ def dl_args(out, **kw):
     base = dict(out=out, images=None, force=False, timeout=5000, retries=3,
                 chunk=4096, verbose=False, quiet=True, format="png",
                 jpeg_quality=92, no_skip_duplicates=False, delete_after=False,
-                naming="continue")
+                naming="continue", no_raw_subfolder=False)
     base.update(kw)
     return argparse.Namespace(**base)
+
+
+def tree(d):
+    """Every file under d, as paths relative to it, sorted."""
+    out = []
+    for root, _, files in os.walk(d):
+        for f in files:
+            out.append(os.path.relpath(os.path.join(root, f), d))
+    return sorted(out)
+
+
+def raws(d):
+    return sorted(f for f in tree(d) if f.endswith((".raw", ".avi")))
 
 
 def test_download(blobs):
@@ -162,12 +175,13 @@ def test_download(blobs):
     blinky.open_camera = lambda a, l: cam
     rc, out = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
                     blinky.RunState())
-    got = sorted(os.listdir(tmp))
+    got = tree(tmp)
     check("exit 0", rc == 0, rc)
-    check("raw + png per still, avi per clip",
-          got == ["image0000.png", "image0000.raw", "image0001.avi"], got)
+    check("raw goes to raw/, picture and clip stay with the pictures",
+          got == ["image0000.png", "image0001.avi", "raw/image0000.raw"], got)
     check("the .raw is the camera's exact bytes",
-          open(os.path.join(tmp, "image0000.raw"), "rb").read() == blobs[0][0])
+          open(os.path.join(tmp, "raw", "image0000.raw"), "rb").read()
+          == blobs[0][0])
     check("the .avi is the untouched raw data",
           open(os.path.join(tmp, "image0001.avi"), "rb").read() == blobs[1][0])
     from PIL import Image
@@ -180,7 +194,7 @@ def test_download(blobs):
     rc, _ = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
                   blinky.RunState())
     check("re-running skips rather than overwriting",
-          rc == 0 and len(os.listdir(tmp)) == 3, os.listdir(tmp))
+          rc == 0 and len(tree(tmp)) == 3, tree(tmp))
 
     tmp2 = tempfile.mkdtemp()
     cam, sim = make_cam(blobs)
@@ -190,8 +204,7 @@ def test_download(blobs):
     # Names come from the output folder's own sequence, not the camera's
     # index, so selecting entry 1 into an empty folder yields image0000.
     check("--images selects just the one photo",
-          sorted(os.listdir(tmp2)) == ["image0000.avi"],
-          sorted(os.listdir(tmp2)))
+          tree(tmp2) == ["image0000.avi"], tree(tmp2))
     try:
         blinky.parse_image_spec("9", 2)
         check("an out-of-range --images is rejected", False)
@@ -207,19 +220,23 @@ def test_duplicates_and_formats(blobs):
     cam, sim = make_cam(blobs)
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
-    first = sorted(os.listdir(tmp))
+    first = tree(tmp)
     check("first run saved everything", len(first) == 3, first)
 
     # Rename everything: a name-based check would now re-download the lot.
-    for name in os.listdir(tmp):
-        os.rename(os.path.join(tmp, name), os.path.join(tmp, "holiday-" + name))
+    for name in first:
+        os.rename(os.path.join(tmp, name),
+                  os.path.join(tmp, os.path.dirname(name),
+                               "holiday-" + os.path.basename(name)))
     cam, sim = make_cam(blobs)
     blinky.open_camera = lambda a, l: cam
     rc, out = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
                     blinky.RunState())
     check("renamed copies are still recognised",
-          sorted(os.listdir(tmp)) == sorted("holiday-" + n for n in first),
-          sorted(os.listdir(tmp)))
+          tree(tmp) == sorted(os.path.join(os.path.dirname(n),
+                                           "holiday-" + os.path.basename(n))
+                              for n in first),
+          tree(tmp))
     check("and it says so", "already saved as" in out or "skipped" in out, out)
 
     # A different photo that happens to reuse a filename must not be clobbered.
@@ -232,7 +249,7 @@ def test_duplicates_and_formats(blobs):
     check("the unrelated file with the same name survived",
           kept.startswith(b"\xff\xd8different"), kept[:20])
     check("the real photo landed beside it under a free name",
-          "image0001.raw" in os.listdir(tmp2), sorted(os.listdir(tmp2)))
+          "raw/image0001.raw" in tree(tmp2), tree(tmp2))
 
     # --no-skip-duplicates goes back to matching names only.
     tmp3 = tempfile.mkdtemp()
@@ -240,8 +257,8 @@ def test_duplicates_and_formats(blobs):
     blinky.open_camera = lambda a, l: cam
     quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
           Log(quiet=True), blinky.RunState())
-    os.rename(os.path.join(tmp3, "image0000.raw"),
-              os.path.join(tmp3, "renamed.raw"))
+    os.rename(os.path.join(tmp3, "raw", "image0000.raw"),
+              os.path.join(tmp3, "raw", "renamed.raw"))
     os.rename(os.path.join(tmp3, "image0000.png"),
               os.path.join(tmp3, "renamed.png"))
     cam, sim = make_cam(blobs)
@@ -249,8 +266,7 @@ def test_duplicates_and_formats(blobs):
     quiet(blinky.cmd_download, dl_args(tmp3, no_skip_duplicates=True),
           Log(quiet=True), blinky.RunState())
     check("--no-skip-duplicates re-downloads a renamed photo",
-          len([f for f in os.listdir(tmp3) if f.endswith(".raw")]) == 2,
-          sorted(os.listdir(tmp3)))
+          len([f for f in raws(tmp3) if f.endswith(".raw")]) == 2, tree(tmp3))
 
     # Formats.
     from PIL import Image
@@ -260,7 +276,7 @@ def test_duplicates_and_formats(blobs):
         blinky.open_camera = lambda a, l: cam
         quiet(blinky.cmd_download, dl_args(d, format=fmt), Log(quiet=True),
               blinky.RunState())
-        got = set(os.listdir(d))
+        got = set(tree(d))
         check("--format %s writes %s" % (fmt, "/".join(sorted(want))),
               want <= got, sorted(got))
         if "image0000.jpg" in got:
@@ -269,6 +285,50 @@ def test_duplicates_and_formats(blobs):
         shutil.rmtree(d)
     for d in (tmp, tmp2, tmp3):
         shutil.rmtree(d)
+
+
+def test_raw_subfolder(blobs):
+    section("raw files in a raw/ subfolder")
+    tmp = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True), blinky.RunState())
+    check("raws go to raw/, pictures stay put",
+          tree(tmp) == ["image0000.png", "image0001.avi", "raw/image0000.raw"],
+          tree(tmp))
+    check("a clip stays with the pictures, being what you watch",
+          os.path.exists(os.path.join(tmp, "image0001.avi")))
+
+    # Duplicate detection has to see into raw/ or everything re-downloads.
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    rc, out = quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
+                    blinky.RunState())
+    check("duplicates are still recognised across the split",
+          len(raws(tmp)) == 2, tree(tmp))
+
+    # And the counter has to see into raw/ or names collide.
+    check("next_free_index counts files in raw/ too",
+          blinky.next_free_index(tmp) == 2, blinky.next_free_index(tmp))
+
+    # Flat layout still available, and still sees the raw/ files.
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp, no_raw_subfolder=True),
+          Log(quiet=True), blinky.RunState())
+    check("--no-raw-subfolder does not re-fetch what raw/ already holds",
+          len(raws(tmp)) == 2, tree(tmp))
+
+    tmp2 = tempfile.mkdtemp()
+    cam, sim = make_cam(blobs)
+    blinky.open_camera = lambda a, l: cam
+    quiet(blinky.cmd_download, dl_args(tmp2, no_raw_subfolder=True),
+          Log(quiet=True), blinky.RunState())
+    check("--no-raw-subfolder keeps everything in one folder",
+          tree(tmp2) == ["image0000.png", "image0000.raw", "image0001.avi"],
+          tree(tmp2))
+    shutil.rmtree(tmp)
+    shutil.rmtree(tmp2)
 
 
 def test_delete_safety(blobs):
@@ -704,7 +764,7 @@ def test_wipe_and_recapture():
     def digests(d):
         import hashlib as _h
         return {_h.sha256(open(os.path.join(d, f), "rb").read()).hexdigest()
-                for f in os.listdir(d) if f.endswith((".raw", ".avi"))}
+                for f in raws(d)}
 
     def all_present(d, blobs):
         import hashlib as _h
@@ -718,12 +778,10 @@ def test_wipe_and_recapture():
         quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
               blinky.RunState())
     check("CLI keeps both sets of photos", all_present(tmp, first + second),
-          sorted(os.listdir(tmp)))
+          tree(tmp))
     check("CLI numbers the new ones on from the old",
-          "image0005.raw" in os.listdir(tmp), sorted(os.listdir(tmp)))
-    check("CLI overwrote nothing",
-          len([f for f in os.listdir(tmp) if f.endswith(".raw")]) == 6,
-          sorted(os.listdir(tmp)))
+          "raw/image0005.raw" in tree(tmp), tree(tmp))
+    check("CLI overwrote nothing", len(raws(tmp)) == 6, tree(tmp))
     shutil.rmtree(tmp)
 
     # And with the camera's own numbering, the old files still survive.
@@ -734,7 +792,7 @@ def test_wipe_and_recapture():
         quiet(blinky.cmd_download, dl_args(tmp, naming="camera"),
               Log(quiet=True), blinky.RunState())
     check("--naming camera also loses nothing",
-          all_present(tmp, first + second), sorted(os.listdir(tmp)))
+          all_present(tmp, first + second), tree(tmp))
     shutil.rmtree(tmp)
 
     # A genuine repeat of the same photos must still be skipped.
@@ -745,8 +803,7 @@ def test_wipe_and_recapture():
         quiet(blinky.cmd_download, dl_args(tmp), Log(quiet=True),
               blinky.RunState())
     check("re-downloading the same photos still skips them",
-          len([f for f in os.listdir(tmp) if f.endswith(".raw")]) == 3,
-          sorted(os.listdir(tmp)))
+          len(raws(tmp)) == 3, tree(tmp))
     shutil.rmtree(tmp)
 
     check("next_free_index on an empty folder is 0",
@@ -809,7 +866,7 @@ def test_update(monkey_free=True):
     log = Log(quiet=True)
     rc, out = quiet(blinky.cmd_update, a, log, blinky.RunState())
     check("a bad checksum refuses", rc == 1, out + log.transcript())
-    check("and writes nothing to disk", os.listdir(tmp) == [], os.listdir(tmp))
+    check("and writes nothing to disk", tree(tmp) == [], tree(tmp))
 
     shutil.rmtree(tmp); tmp = tempfile.mkdtemp()
     a = argparse.Namespace(check=False, install=False, yes=False, out=tmp)
@@ -817,7 +874,7 @@ def test_update(monkey_free=True):
     log = Log(quiet=True)
     rc, out = quiet(blinky.cmd_update, a, log, blinky.RunState())
     check("SHA256SUMS not covering the file refuses",
-          rc == 1 and os.listdir(tmp) == [], (rc, os.listdir(tmp)))
+          rc == 1 and tree(tmp) == [], (rc, tree(tmp)))
 
     # Nothing newer available.
     blinky._http_get = fake_release("x", version=blinky.__version__)
@@ -880,6 +937,7 @@ def main():
     test_download(blobs)
     test_duplicates_and_formats(blobs)
     test_wipe_and_recapture()
+    test_raw_subfolder(blobs)
     test_delete_safety(blobs)
     test_delete_command(blobs)
     test_list(blobs)

@@ -1,3 +1,17 @@
+blinky (1.3-1) unstable; urgency=low
+
+  * Download to blink-pics inside the user's Pictures folder by default,
+    found through XDG so a localised or relocated Pictures folder is honoured.
+  * Put the raw camera data in a raw/ subfolder, so the main folder holds
+    only things worth looking at. --no-raw-subfolder, or unticking the box in
+    the window, keeps the old flat layout. Video clips stay with the pictures
+    either way, the .avi being both the raw data and what you watch.
+  * Duplicate detection and file numbering both look in the folder and its
+    raw/ subfolder, so switching layouts does not cause a re-download or a
+    name collision.
+
+ -- antair <antairdo@gmail.com>  Sat, 19 Sep 2026 08:20:00 +0000
+
 blinky (1.2-1) unstable; urgency=low
 
   * Stop treating the camera's photo index as an identity. It restarts at

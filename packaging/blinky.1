@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.2" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.3" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -83,7 +83,15 @@ omitted. If the kernel log cannot be read, blinky says so and carries on.
 .SH "DOWNLOAD OPTIONS"
 .TP
 .BI \-\-out " DIR"
-Output directory. Default ~/blink-pics.
+Output directory. Defaults to blink\-pics inside your Pictures folder, as XDG
+reports it.
+.TP
+.B \-\-no\-raw\-subfolder
+Keep the .raw files beside the pictures. By default they go into a
+.I raw/
+subfolder, so the main folder holds only things you would want to look at.
+Video clips stay with the pictures either way, since the .avi is both the raw
+data and the thing you watch.
 .TP
 .BI \-\-images " SPEC"
 Which photos, for example \fB0,2-4\fR. Default: all.
@@ -164,7 +172,7 @@ Interrupted.
 .I /usr/lib/udev/rules.d/70-blinky-sipix.rules
 Grants your login session access to the camera. Installed by this package.
 .TP
-.I ~/blink-pics
+.I ~/Pictures/blink-pics
 Default output directory.
 .SH NOTES
 This camera's USB link can be fragile. Errors such as \fB-71\fR (EPROTO) or

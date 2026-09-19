@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.2-1_all.deb
+sudo apt install ./packaging/blinky_1.3-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -127,6 +127,25 @@ Useful options: `--images 0,2-4`, `--out DIR`, `--force`, `--format both`,
 on any command.
 
 ### Output layout
+
+Downloads go to `blink-pics` inside your Pictures folder by default (wherever
+XDG says that is), and the raw camera data goes into a `raw/` subfolder so the
+main folder holds only things you would want to look at:
+
+```
+~/Pictures/blink-pics/
+    image0000.png
+    image0001.png
+    image0002.avi        a clip: the raw data *is* what you watch
+    raw/
+        image0000.raw
+        image0001.raw
+```
+
+`--no-raw-subfolder` (or unticking the box in the window) keeps everything in
+one folder. Either way both locations are searched when deciding what is
+already saved and what to number next, so switching does not cause a
+re-download.
 
 Stills are saved **twice**: `imageNNNN.raw` is the exact byte stream from the
 camera, written and fsynced *before* anything tries to interpret it, and
