@@ -1,3 +1,16 @@
+blinky (1.7-1) unstable; urgency=low
+
+  * doctor now understands how far down a hub chain the camera is. It reads
+    the failing port path out of the kernel log, counts the hubs between it
+    and the controller, and says so: a full-speed device from 2002 has its
+    traffic wrapped in split transactions by every high-speed hub on the way,
+    and a chain of them is the commonest way to make it unreachable.
+  * The free-port list is now ordered shallowest first, labelled with each
+    port's depth, and truncated so it stops recommending ports that are
+    several hubs down -- which was advice against itself.
+
+ -- antair <antairdo@gmail.com>  Fri, 25 Sep 2026 18:10:00 +0000
+
 blinky (1.6.1-1) unstable; urgency=low
 
   * Fix the erase confirmation sizing badly. It pinned its width with

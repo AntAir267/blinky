@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.6.1"
+__version__ = "1.7"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -359,6 +359,8 @@ SYSFS_USB = "/sys/bus/usb/devices"
 
 # "usb 3-2: ..." or "usb usb3-port2: ..." -> the bus the failure happened on.
 KERNEL_BUS_RE = re.compile(r"usb (?:usb)?(\d+)[-\s]")
+# "usb 7-1.3.3.4: ..." -> the full port path, whose dots count the hubs.
+KERNEL_PATH_RE = re.compile(r"usb (\d+-[\d.]+):")
 
 
 def _read_sysfs(path, default=""):
@@ -404,8 +406,15 @@ def usb_port_survey():
             speed = float(_read_sysfs(os.path.join(base, "speed"), "0"))
         except ValueError:
             speed = 0.0
+        # "usb7" is the controller itself; "7-1" is one hub down, "7-1.3"
+        # two, and so on. A full-speed device has to be reached through a
+        # transaction translator in each high-speed hub on the way, and the
+        # timing budget tightens at every hop, so depth is the single most
+        # useful thing to know about a candidate port.
+        depth = 0 if is_root else name.split("-", 1)[-1].count(".") + 1
         hubs.append({
             "name": name,
+            "depth": depth,
             "bus": _read_sysfs(os.path.join(base, "busnum"), "?"),
             "product": _read_sysfs(os.path.join(base, "product"),
                                    "root hub" if is_root else "hub").strip(),
@@ -429,29 +438,63 @@ def bus_from_kernel_hits(hits):
     return None
 
 
-def link_advice(failed_bus=None):
+def depth_from_kernel_hits(hits):
+    """(path, hub depth) of the most recent logged fault, if it names a port.
+
+    "7-1.3.3.4" is three hubs below the controller: one per dot.
+    """
+    for line, _ in reversed(hits):
+        m = KERNEL_PATH_RE.search(line)
+        if m:
+            path = m.group(1)
+            return path, path.split("-", 1)[-1].count(".")
+    return None, None
+
+
+def link_advice(failed_bus=None, failed_depth=None, failed_path=None):
     """Advice for a link-layer fault, naming ports that actually exist here."""
-    lines = [
-        "These are link-layer faults, not software faults, but two of the "
-        "remedies are free and need no different hardware.",
-        "",
-        "1. Move the camera to a port on a different host controller. A "
-        "self-powered hub beats a root port: it supplies more current and "
-        "isolates the device from the controller that is failing.",
+    lines = ["These are link-layer faults, not software faults, but two of "
+             "the remedies are free and need no different hardware.", ""]
+    if failed_depth:
+        lines += [
+            "The camera was at %s, which is %d hub%s below the controller. "
+            "That alone is very likely the problem: it is a full-speed device "
+            "from 2002, and every high-speed hub in the way has to wrap its "
+            "traffic in split transactions." % (failed_path, failed_depth,
+                                                "" if failed_depth == 1 else "s"),
+            "",
+        ]
+    lines += [
+        "1. Plug the camera in with as few hubs in the way as possible, "
+        "ideally straight into the machine. Ports are listed shallowest "
+        "first.",
     ]
     # This camera is a full-speed (12 Mbps) device, so a SuperSpeed root hub
     # is not somewhere it can ever attach; listing those would be noise.
     candidates = [h for h in usb_port_survey()
                   if h["free"] and not (h["root"] and h["speed"] >= 5000)]
-    # External hubs first: they are the genuinely different electrical path.
+    # Shallowest first. Every hub between the camera and the controller adds
+    # a transaction translator and tightens the timing, and this camera is a
+    # full-speed device from 2002: it is the first thing to fall over.
     candidates.sort(key=lambda h: (h["bus"] == str(failed_bus)
                                    if failed_bus is not None else False,
-                                   h["root"], not h["self_powered"]))
+                                   h["depth"], not h["self_powered"]))
     if candidates:
+        # Anything several hubs down is the situation being escaped from, so
+        # showing a dozen of them would be advice against itself.
+        shown = [h for h in candidates if h["depth"] <= 1][:6] or candidates[:4]
+        hidden = len(candidates) - len(shown)
         lines.append("")
         lines.append("   Free ports on this machine right now:")
-        for h in candidates:
+        for h in shown:
             tag = []
+            if h["depth"] == 0:
+                tag.append("straight into the controller, no hub")
+            elif h["depth"] == 1:
+                tag.append("one hub deep")
+            else:
+                tag.append("%d hubs deep, which this camera dislikes"
+                           % h["depth"])
             if h["self_powered"]:
                 tag.append("self-powered")
             if failed_bus is not None and h["bus"] == str(failed_bus):
@@ -460,6 +503,10 @@ def link_advice(failed_bus=None):
                          % (h["bus"], h["name"], h["product"] or "hub",
                             ", ".join(str(p) for p in h["free"]),
                             ("  [%s]" % "; ".join(tag)) if tag else ""))
+        if hidden:
+            lines.append("     (%d deeper port%s not listed: more hubs is the "
+                         "wrong direction here)"
+                         % (hidden, "" if hidden == 1 else "s"))
         lines.append("   Some of those may be internal headers rather than "
                      "sockets you can reach; sysfs cannot tell the "
                      "difference.")
@@ -614,7 +661,8 @@ def report_kernel_trouble(log, since=None):
             explained.append(explanation)
     for explanation in explained:
         log.info("  -> %s" % explanation)
-    for line in _wrap(link_advice(bus_from_kernel_hits(hits))):
+    _path, _depth = depth_from_kernel_hits(hits)
+    for line in _wrap(link_advice(bus_from_kernel_hits(hits), _depth, _path)):
         log.info("  %s" % line)
     return hits
 
@@ -1516,7 +1564,8 @@ def run_checks(log, timeout=DEFAULT_TIMEOUT_MS, chunk=DEFAULT_CHUNK,
                                   "camera, cable, port or hub dropped the "
                                   "connection; no amount of software change "
                                   "will fix them.")
-                fix = link_advice(bus_from_kernel_hits(hits))
+                path, depth = depth_from_kernel_hits(hits)
+                fix = link_advice(bus_from_kernel_hits(hits), depth, path)
             else:
                 detail.append("no USB link errors in the recent kernel log")
                 explanation += (" The kernel log shows no USB errors, so the "

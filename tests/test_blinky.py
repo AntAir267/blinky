@@ -1133,6 +1133,52 @@ def test_update(monkey_free=True):
     shutil.rmtree(tmp)
 
 
+def test_hub_depth():
+    section("hub depth: the thing that actually breaks a full-speed camera")
+    hits = [("usb 7-1.3.3.4: device descriptor read/64, error -32", "x")]
+    path, depth = blinky.depth_from_kernel_hits(hits)
+    check("a nested port path is read from the kernel log",
+          (path, depth) == ("7-1.3.3.4", 3), (path, depth))
+    check("a root port counts as no hubs",
+          blinky.depth_from_kernel_hits(
+              [("usb 5-1: device descriptor read/all, error -71", "x")])[1] == 0)
+    check("a port-style message without a path yields nothing",
+          blinky.depth_from_kernel_hits(
+              [("usb usb3-port2: disabled by hub (EMI?)", "x")]) == (None, None))
+    check("the bus is still read from the same line",
+          blinky.bus_from_kernel_hits(hits) == "7",
+          blinky.bus_from_kernel_hits(hits))
+
+    survey = blinky.usb_port_survey()
+    check("every surveyed hub reports a depth",
+          all("depth" in h for h in survey), len(survey))
+    check("a root hub is depth 0",
+          all(h["depth"] == 0 for h in survey if h["root"]),
+          [(h["name"], h["depth"]) for h in survey if h["root"]][:4])
+    for h in survey:
+        if not h["root"]:
+            expect = h["name"].split("-", 1)[-1].count(".") + 1
+            if h["depth"] != expect:
+                check("depth matches the sysfs name for %s" % h["name"], False,
+                      (h["depth"], expect))
+                break
+    else:
+        check("depth matches the sysfs name for every hub", True)
+
+    advice = blinky.link_advice(failed_bus="7", failed_depth=3,
+                                failed_path="7-1.3.3.4")
+    check("the advice names the failing port and its depth",
+          "7-1.3.3.4" in advice and "3 hub" in advice, advice[:160])
+    check("it tells you to use fewer hubs",
+          "as few hubs in the way as possible" in advice)
+    check("it does not recommend going deeper",
+          "4 hubs deep" not in advice.split("not listed")[0],
+          advice[:400])
+    plain = blinky.link_advice()
+    check("it still works with nothing known about the failure",
+          "link-layer faults" in plain and "hub" in plain)
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -1184,6 +1230,7 @@ def main():
     test_gui_erase_path(blobs)
     test_gui_chrome()
     test_update()
+    test_hub_depth()
     test_misc()
 
     print("\n%s" % ("-" * 60))

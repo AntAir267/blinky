@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.6.1-1_all.deb
+sudo apt install ./packaging/blinky_1.7-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -323,8 +323,12 @@ the connection. `blinky` is built around that:
   offering a fix that does not work.
 
 When `doctor` blames the link, its advice is built from this machine rather
-than from generic suggestions: it surveys sysfs for ports that are actually
-free, skips SuperSpeed root hubs (a 12 Mbps full-speed camera cannot attach to
+than from generic suggestions. It reads the failing port out of the kernel log
+and counts how many hubs sit between it and the controller — the camera is a
+full-speed device from 2002, so every high-speed hub in the way has to wrap
+its traffic in split transactions, and a chain of them is the most common way
+to make it unreachable. It then surveys sysfs for ports that are actually
+free, lists them shallowest first and hides the deep ones, skips SuperSpeed root hubs (a 12 Mbps full-speed camera cannot attach to
 one), flags external self-powered hubs, deprioritises the bus the failure
 happened on, and prints the two runtime kernel knobs worth trying —
 `usbcore.old_scheme_first=1`, which makes the kernel assign an address before
