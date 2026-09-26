@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.7" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.7.1" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -212,6 +212,12 @@ Rebuilding the container re-encodes each frame, which is a second lossy pass,
 so the camera's own bytes are kept in the raw folder and
 .B blinky decode
 can rebuild the video from them at any time.
+.SH "THE CAMERA FORGETS"
+Pictures live in 8 MB of SDRAM, not flash, kept alive by the batteries. They
+survive being unplugged from USB, but a flat or removed battery erases
+everything and nothing recovers it. Download before changing batteries or
+storing the camera, and treat a misbehaving link as a countdown rather than
+an inconvenience.
 .SH NOTES
 This camera's USB link can be fragile. Errors such as \fB-71\fR (EPROTO) or
 \fBdisabled by hub (EMI?)\fR in the kernel log are link-layer faults: the cable,

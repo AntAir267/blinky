@@ -646,6 +646,8 @@ def test_list(blobs):
     check("shows the firmware ID", "01 02 03 04 05 06" in out, out)
     check("shows the photo count", "photos      : 2" in out, out)
     check("shows the expected table size", "expected 8*(2+1) = 24" in out, out)
+    check("list warns that the camera's memory is volatile",
+          "SDRAM" in out, out[-200:])
     check("maps still -> .png and clip -> .avi",
           "image0000.png" in out and "image0001.avi" in out, out)
 
@@ -1177,6 +1179,13 @@ def test_hub_depth():
     plain = blinky.link_advice()
     check("it still works with nothing known about the failure",
           "link-layer faults" in plain and "hub" in plain)
+    # Pictures live in battery-backed SDRAM, so a broken link is also a
+    # countdown. Saying so is the difference between an inconvenience and
+    # losing the photos.
+    check("a broken link warns that memory is volatile",
+          "SDRAM" in plain and "batter" in plain, plain[:200])
+    check("and is clear that unplugging is not what erases it",
+          "survive being unplugged" in blinky.VOLATILE_WARNING)
 
 
 def test_misc():

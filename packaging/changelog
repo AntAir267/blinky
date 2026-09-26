@@ -1,3 +1,13 @@
+blinky (1.7.1-1) unstable; urgency=low
+
+  * Warn that the camera's memory is volatile. Pictures live in 8 MB of
+    SDRAM kept alive by the batteries: unplugging is harmless, but a flat or
+    removed battery erases everything irrecoverably. doctor says so whenever
+    the link is broken, since stranded pictures are then on a clock, and
+    list says so whenever there is something on the camera to lose.
+
+ -- antair <antairdo@gmail.com>  Fri, 25 Sep 2026 19:20:00 +0000
+
 blinky (1.7-1) unstable; urgency=low
 
   * doctor now understands how far down a hub chain the camera is. It reads

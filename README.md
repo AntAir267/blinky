@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.7-1_all.deb
+sudo apt install ./packaging/blinky_1.7.1-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -301,6 +301,20 @@ the camera's own memory, gphoto2 writes no file at all; `blinky` decodes the
 rows that are readable, marks the result partial, and keeps the raw bytes. On
 this camera `image0005` is such a photo — three independent transfers return
 byte-identical data, so the damage is on the device, not on the wire.
+
+## The camera forgets
+
+Pictures live in 8 MB of **SDRAM**, not flash, kept alive by the batteries.
+They survive being unplugged from USB — the batteries carry them — but a flat
+or removed battery erases everything, and nothing recovers it. SiPix's manual
+is blunt about it: *"Battery power is required to maintain pictures in memory.
+Loss of image data will occur should the batteries lose power."*
+
+Two practical consequences. Download before changing batteries or storing the
+camera. And when the link is misbehaving, that is not merely an inconvenience
+— anything still on the camera is on a clock, so getting it onto a port that
+works matters more than diagnosing the broken one. `blinky doctor` and
+`blinky list` both say so.
 
 ## Reliability notes
 

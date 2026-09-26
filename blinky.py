@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.7"
+__version__ = "1.7.1"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -516,6 +516,8 @@ def link_advice(failed_bus=None, failed_depth=None, failed_path=None):
 
     lines += [
         "",
+        "Worth knowing while the link is down: %s" % VOLATILE_WARNING,
+        "",
         "2. Old cameras often cannot survive the kernel's modern enumeration "
         "sequence, which reads the device descriptor before assigning an "
         "address; 'device descriptor read/all, error -71' is that failure. "
@@ -690,6 +692,19 @@ class NotPresent(CameraError):
 class DeviceStalled(CameraError):
     pass
 
+
+# The camera holds pictures in 8 MB of SDRAM kept alive by its batteries.
+# Unplugging from USB is harmless -- the batteries carry it -- but a flat or
+# removed battery erases everything, and there is no recovering it. The
+# manual: "Battery power is required to maintain pictures in memory. Loss of
+# image data will occur should the batteries lose power."
+VOLATILE_WARNING = (
+    "This camera keeps its pictures in SDRAM, not flash. They survive being "
+    "unplugged, because the batteries maintain them, but a flat or removed "
+    "battery erases the lot and nothing can bring them back. Anything still "
+    "on the camera is only as safe as its batteries, so download while you "
+    "have a working connection."
+)
 
 STALL_ADVICE = (
     "Power-cycle the camera: unplug it (or take the batteries out) for a few "
@@ -2125,6 +2140,9 @@ def cmd_list(args, log, state):
                                                       else ".png")))
         log.out("")
         log.out("total: %d photo(s), %d bytes to transfer" % (len(entries), total))
+        log.out("")
+        for line in _wrap(VOLATILE_WARNING):
+            log.out("  %s" % line)
         return 0
     except CameraError as exc:
         explain_camera_error(log, exc, since)
