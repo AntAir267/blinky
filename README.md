@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.7.1-1_all.deb
+sudo apt install ./packaging/blinky_1.8-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -118,6 +118,7 @@ and conveniently it is what Aqua did anyway.
 | `blinky download` | Fetch photos to `~/blink-pics`: raw bytes first, then decode |
 | `blinky decode RAW...` | Decode already-saved `.raw` files to PNG (no camera needed) |
 | `blinky delete` | Erase photos from the camera |
+| `blinky watch` | Download by itself whenever the camera is plugged in |
 | `blinky update` | Fetch a newer release from GitHub |
 | `blinky convert [PATH...]` | Batch-convert `.pnm` files to PNG (no camera needed) |
 | `blinky-gui` | The window shown above |
@@ -301,6 +302,21 @@ the camera's own memory, gphoto2 writes no file at all; `blinky` decodes the
 rows that are readable, marks the result partial, and keeps the raw bytes. On
 this camera `image0005` is such a photo — three independent transfers return
 byte-identical data, so the damage is on the device, not on the wire.
+
+## Downloading without being asked
+
+```bash
+blinky watch                                  # until you stop it
+systemctl --user enable --now blinky-watch    # from login, every time
+```
+
+`watch` waits for the camera and downloads the moment it appears. This is the
+sane default for this hardware rather than a convenience: the pictures are in
+volatile memory, and the link often needs several attempts, so a transfer that
+dies halfway simply resumes on the next plug — duplicate detection skips
+whatever is already saved, so nothing is fetched twice and every attempt gains
+ground. It notifies on the desktop when a download finishes or partially
+succeeds.
 
 ## The camera forgets
 

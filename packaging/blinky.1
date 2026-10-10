@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.7.1" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.8" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -33,6 +33,21 @@ with each entry's address range and size.
 .TP
 .B download
 Download photos. Raw bytes reach the disk before any decoding is attempted.
+.TP
+.B watch
+Sit waiting for the camera and download by itself whenever it appears. Written
+for a camera whose pictures are in volatile memory behind a link that often
+needs several attempts: plugging it in is enough, and a transfer that dies
+halfway resumes on the next plug, since duplicate detection skips whatever is
+already saved. A desktop notification reports each result if
+.BR notify-send (1)
+is available.
+.PP
+To have it run from login:
+.PP
+.RS
+.B systemctl --user enable --now blinky-watch
+.RE
 .TP
 .B update
 Ask GitHub whether a newer release exists, and fetch it. The download is
@@ -147,6 +162,18 @@ Install the download. This runs \fBsudo apt install\fR.
 .TP
 .BI \-\-out " DIR"
 Where to put the download. Default: a temporary folder.
+.SH "WATCH OPTIONS"
+.TP
+.B \-\-once
+Stop after the first complete download instead of waiting for the next plug.
+.TP
+.BI \-\-settle " SEC"
+Pause after the camera appears before speaking to it, default 3. This camera
+is reliably unhappy if addressed the instant it enumerates.
+.TP
+.BI \-\-expect " N"
+How many photos you expect in total, so partial progress can be reported
+against it.
 .SH "DELETE OPTIONS"
 .TP
 .B \-\-all

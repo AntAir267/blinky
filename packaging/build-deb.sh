@@ -4,7 +4,7 @@ set -e
 
 here=$(cd "$(dirname "$0")" && pwd)
 src=$(dirname "$here")
-version=1.7.1
+version=1.8
 revision=1
 pkg="blinky_${version}-${revision}_all"
 build="$here/build/$pkg"
@@ -49,6 +49,8 @@ chmod 755 "$build/usr/bin/blinky" "$build/usr/bin/blinky-gui"
 
 install -m 644 "$here/70-blinky-sipix.rules" "$build/usr/lib/udev/rules.d/"
 install -m 644 "$here/blinky.desktop"        "$build/usr/share/applications/"
+install -D -m 644 "$here/blinky-watch.service" \
+    "$build/usr/lib/systemd/user/blinky-watch.service"
 
 # Icons are rendered from blinky_gui.paint_icon so the window icon and the
 # desktop icon are the same drawing. Regenerate if PyQt6 is available;

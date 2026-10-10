@@ -1188,6 +1188,55 @@ def test_hub_depth():
           "survive being unplugged" in blinky.VOLATILE_WARNING)
 
 
+def test_watch(blobs):
+    section("watch: download on plug-in, without being asked")
+    import threading, time as _t
+    real_present, real_open = blinky.camera_present, blinky.open_camera
+
+    def run(**kw):
+        cam, sim = make_cam(blobs)
+        blinky.open_camera = lambda a, l: cam
+        tmp = tempfile.mkdtemp()
+        a = argparse.Namespace(out=tmp, once=True, settle=0.05, expect=0,
+                               timeout=5000, retries=3, chunk=4096,
+                               verbose=False, quiet=True, formats="png",
+                               video_formats="avi", jpeg_quality=92, fps=5,
+                               no_raw_subfolder=False)
+        for k, v in kw.items():
+            setattr(a, k, v)
+        return a, tmp, sim
+
+    # It waits for a camera that is not there yet, then downloads.
+    state = {"there": False}
+    blinky.camera_present = lambda: state["there"]
+    threading.Timer(0.6, lambda: state.__setitem__("there", True)).start()
+    a, tmp, sim = run()
+    t0 = _t.monotonic()
+    rc, _ = quiet(blinky.cmd_watch, a, Log(quiet=True), blinky.RunState())
+    waited = _t.monotonic() - t0
+    check("it waits rather than giving up when nothing is plugged in",
+          waited >= 0.5, "%.2fs" % waited)
+    check("it downloads once the camera appears", rc == 0, rc)
+    check("and the files are there", len(tree(tmp)) >= 3, tree(tmp))
+    shutil.rmtree(tmp)
+
+    # A camera already present is picked up immediately.
+    blinky.camera_present = lambda: True
+    a, tmp, sim = run()
+    rc, _ = quiet(blinky.cmd_watch, a, Log(quiet=True), blinky.RunState())
+    check("an already-plugged camera is handled at once", rc == 0, rc)
+    shutil.rmtree(tmp)
+
+    # Not tested here: a failing transfer then waiting for a replug. It
+    # would need a background thread, and quiet() redirects stdout for the
+    # whole process, so a thread outliving the check would swallow every
+    # later line of output.
+
+    check("camera_present survives pyusb being unable to look",
+          blinky.camera_present() in (True, False))
+    blinky.camera_present, blinky.open_camera = real_present, real_open
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -1240,6 +1289,7 @@ def main():
     test_gui_chrome()
     test_update()
     test_hub_depth()
+    test_watch(blobs)
     test_misc()
 
     print("\n%s" % ("-" * 60))

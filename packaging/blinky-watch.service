@@ -1,0 +1,17 @@
+[Unit]
+Description=Download photos from a SiPix Blink II whenever it is plugged in
+Documentation=man:blinky(1)
+
+[Service]
+Type=simple
+# The camera holds its pictures in volatile memory, so the useful behaviour
+# is to get them off the moment it appears rather than wait to be asked.
+ExecStart=/usr/bin/blinky watch
+Restart=on-failure
+RestartSec=10
+# Nothing here needs more than the user's own access to the device.
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

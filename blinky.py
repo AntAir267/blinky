@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.7.1"
+__version__ = "1.8"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -2560,6 +2560,126 @@ def cmd_update(args, log, state):
     return 0
 
 
+def camera_present():
+    """Is the camera enumerated right now?"""
+    try:
+        usb = _import_usb()
+    except CameraError:
+        return False
+    try:
+        return usb.core.find(idVendor=VENDOR_ID, idProduct=PRODUCT_ID) is not None
+    except Exception:
+        return False
+
+
+def _wait_for(present, timeout=None, poll=1.5):
+    """Block until the camera is present (or absent). True if it happened."""
+    start = time.monotonic()
+    while timeout is None or time.monotonic() - start < timeout:
+        if camera_present() == present:
+            return True
+        time.sleep(poll)
+    return False
+
+
+def _notify(title, body, log):
+    """A desktop notification, if the desktop offers one."""
+    if shutil.which("notify-send") is None:
+        return
+    try:
+        subprocess.run(["notify-send", "-a", "Blinky", "-i", "blinky",
+                        title, body], timeout=5,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.debug("notify-send failed: %s" % exc)
+
+
+def cmd_watch(args, log, state):
+    """Download by itself whenever the camera appears.
+
+    Written for a camera that holds its pictures in volatile memory behind a
+    link that often needs several attempts: plugging it in should be enough,
+    and a transfer that dies halfway should resume on the next plug rather
+    than wait for someone to notice.
+    """
+    outdir = os.path.expanduser(args.out)
+    log.out("Watching for the camera. Plug it in and it will download by "
+            "itself; press Ctrl-C to stop.")
+    log.out("Saving to %s" % outdir)
+    if args.once:
+        log.out("(--once: will stop after the first complete download)")
+    log.out("")
+
+    rounds = 0
+    barren = 0
+    try:
+        while True:
+            if not camera_present():
+                _wait_for(True)
+            rounds += 1
+            # Let enumeration settle before the first control transfer; this
+            # camera is reliably unhappy if spoken to immediately.
+            time.sleep(args.settle)
+
+            before = len(local_fingerprints(outdir))
+            dl = argparse.Namespace(
+                out=args.out, images=None, force=False,
+                timeout=args.timeout, retries=args.retries, chunk=args.chunk,
+                verbose=args.verbose, quiet=args.quiet, formats=args.formats,
+                video_formats=args.video_formats,
+                jpeg_quality=args.jpeg_quality, fps=args.fps,
+                naming="continue", no_skip_duplicates=False,
+                delete_after=False, no_raw_subfolder=args.no_raw_subfolder)
+            log.out("--- attempt %d ---" % rounds)
+            try:
+                rc = cmd_download(dl, log, state)
+            except CameraError as exc:
+                log.error(str(exc))
+                rc = 1
+            gained = len(local_fingerprints(outdir)) - before
+
+            if rc == 0:
+                log.out("Everything on the camera is saved.")
+                _notify("Camera downloaded",
+                        "Everything is saved to %s" % outdir, log)
+                if args.once:
+                    return 0
+                log.out("Waiting for the camera to be unplugged.")
+                _wait_for(False)
+                barren = 0
+                continue
+
+            if gained:
+                barren = 0
+                held = len(local_fingerprints(outdir))
+                if args.expect:
+                    msg = ("Saved %d more, %d of about %d now. Replug to "
+                           "carry on." % (gained, held, args.expect))
+                else:
+                    msg = ("Saved %d more this attempt. Replug to carry on."
+                           % gained)
+                log.out(msg)
+                _notify("Partial download", msg, log)
+            else:
+                barren += 1
+                log.warn("that attempt saved nothing new")
+                if barren >= 3:
+                    log.out("Three attempts in a row gained nothing; pausing "
+                            "for a minute so this does not spin.")
+                    time.sleep(60)
+                    barren = 0
+
+            # Wait for it to go away before trying again, so a wedged camera
+            # that is still enumerated does not get hammered.
+            if camera_present():
+                log.out("Unplug and replug to try again.")
+                _wait_for(False, timeout=600)
+    except KeyboardInterrupt:
+        log.out("")
+        log.out("Stopped. %d attempt(s) made." % rounds)
+        return 0
+
+
 def cmd_delete(args, log, state):
     """Erase the camera. Destructive, irreversible, and always confirmed."""
     since = log.start_wall.strftime("%Y-%m-%d %H:%M:%S")
@@ -2885,6 +3005,7 @@ examples:
   blinky delete --last 1            erase just the newest photo
   blinky decode ~/blink-pics/image0000.raw
   blinky convert ~/blink-pics       batch .pnm -> .png, originals kept
+  blinky watch                     download by itself whenever it is plugged in
   blinky update                    check GitHub for a newer release
   blinky update --install          ... and install it
 
@@ -2932,6 +3053,22 @@ imageNNNN.avi is itself the untouched raw data.
                         "verified on disk (refused if anything failed, or if "
                         "--images selected only some of them)")
     p.set_defaults(func=cmd_download)
+
+    p = add_common_options(sub.add_parser(
+        "watch", help="download automatically whenever the camera appears"))
+    p.add_argument("--out", default=DEFAULT_OUTDIR, metavar="DIR",
+                   help="output directory (default %s)" % DEFAULT_OUTDIR)
+    p.add_argument("--once", action="store_true",
+                   help="stop after the first complete download")
+    p.add_argument("--settle", type=float, default=3.0, metavar="SEC",
+                   help="pause after the camera appears before speaking to "
+                        "it (default 3)")
+    p.add_argument("--expect", type=int, default=0, metavar="N",
+                   help="how many photos you expect in total, for progress")
+    add_format_options(p)
+    p.add_argument("--no-raw-subfolder", action="store_true",
+                   help="keep the .raw files beside the pictures")
+    p.set_defaults(func=cmd_watch)
 
     p = add_common_options(sub.add_parser(
         "update", help="check GitHub for a newer release"))

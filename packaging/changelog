@@ -1,3 +1,17 @@
+blinky (1.8-1) unstable; urgency=low
+
+  * Add `blinky watch`: wait for the camera and download the moment it
+    appears, with no prompting. For hardware whose pictures sit in volatile
+    memory behind a link that often needs several attempts, this is the sane
+    default rather than a convenience -- a transfer that dies halfway
+    resumes on the next plug, because duplicate detection skips what is
+    already saved and every attempt gains ground.
+  * Ship a systemd user unit, so it can run from login:
+    systemctl --user enable --now blinky-watch
+  * Report each result as a desktop notification where notify-send exists.
+
+ -- antair <antairdo@gmail.com>  Fri, 10 Oct 2026 11:40:00 +0000
+
 blinky (1.7.1-1) unstable; urgency=low
 
   * Warn that the camera's memory is volatile. Pictures live in 8 MB of
