@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.9"
+__version__ = "1.10"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -2594,6 +2594,272 @@ def _notify(title, body, log):
         log.debug("notify-send failed: %s" % exc)
 
 
+def probe_link(log, settle=0.0):
+    """Try the handshake. Returns (ok, detail)."""
+    if not camera_present():
+        return False, "not on the bus"
+    if settle:
+        time.sleep(settle)
+    cam = Blink2(log)
+    try:
+        cam.open()
+        count = cam.get_numpics()
+        return True, "%d photo%s on the camera" % (count,
+                                                   "" if count == 1 else "s")
+    except CameraError as exc:
+        return False, str(exc)
+    except Exception as exc:
+        return False, "%s: %s" % (type(exc).__name__, exc)
+    finally:
+        try:
+            cam.close()
+        except Exception:
+            pass
+
+
+def camera_path():
+    """Where the camera sits, and how many hubs are in the way."""
+    try:
+        names = os.listdir(SYSFS_USB)
+    except OSError:
+        return None, None
+    for name in sorted(names):
+        if ":" in name or name.startswith("usb"):
+            continue
+        base = os.path.join(SYSFS_USB, name)
+        if (_read_sysfs(os.path.join(base, "idVendor")) == "%04x" % VENDOR_ID
+                and _read_sysfs(os.path.join(base, "idProduct"))
+                == "%04x" % PRODUCT_ID):
+            return name, name.split("-", 1)[-1].count(".")
+    return None, None
+
+
+def shallow_ports(limit=3):
+    """The least-hubbed free ports, as advice a person can act on."""
+    out = []
+    for h in usb_port_survey():
+        if not h["free"] or (h["root"] and h["speed"] >= 5000):
+            continue
+        out.append(h)
+    out.sort(key=lambda h: (h["depth"], not h["self_powered"]))
+    return out[:limit]
+
+
+def _await_change(log, settle=3.0, timeout=600):
+    """Wait for the camera to be unplugged and plugged back in."""
+    log.out("    waiting for you to do that (Ctrl-C to stop)")
+    if camera_present():
+        if not _wait_for(False, timeout=timeout):
+            log.warn("the camera never went away; carrying on anyway")
+            return False
+    if not _wait_for(True, timeout=timeout):
+        log.warn("the camera did not come back")
+        return False
+    time.sleep(settle)
+    return True
+
+
+def cmd_recover(args, log, state):
+    """Work the problem: try each remedy in turn and verify after each.
+
+    doctor says what is wrong once. This walks the ladder we worked out the
+    hard way, cheapest and least destructive first, checking after every
+    rung, and stops the moment the camera answers.
+    """
+    log.out("Recovery: trying each remedy in turn, cheapest first.")
+    log.out("")
+
+    ok, detail = probe_link(log, settle=0.5)
+    if ok:
+        log.out("The camera is already answering: %s" % detail)
+        return _recover_finish(args, log, state)
+
+    path, depth = camera_path()
+    log.out("Starting point: %s" % (
+        "not on the bus" if path is None
+        else "%s, %d hub%s deep -- %s" % (path, depth,
+                                          "" if depth == 1 else "s", detail)))
+    log.out("")
+
+    for step in _recovery_ladder(args, path, depth):
+        log.out("* %s" % step["title"])
+        for line in _wrap(step["why"]):
+            log.out("    %s" % line)
+        if step.get("destructive") and not args.yes:
+            log.out("")
+            log.out("    This is the last resort and it erases any photos "
+                    "still on the camera.")
+            if not sys.stdin.isatty():
+                log.out("    Stopping here. Re-run with --yes to include it.")
+                return 1
+            try:
+                if input("    Type 'yes' to try it: ").strip() != "yes":
+                    log.out("    Skipped. Nothing else left to try.")
+                    return 1
+            except (EOFError, KeyboardInterrupt):
+                log.out("")
+                return 1
+
+        try:
+            step["act"](log)
+        except CameraError as exc:
+            log.warn("that step did not apply: %s" % exc)
+
+        ok, detail = probe_link(log, settle=1.0)
+        if ok:
+            log.out("    -> working: %s" % detail)
+            log.out("")
+            return _recover_finish(args, log, state)
+        log.out("    -> still failing: %s" % detail)
+        log.out("")
+
+    log.error("none of the remedies worked")
+    log.out("")
+    log.out("What is left is hardware: a different cable, a different "
+            "machine, or the camera's USB side has failed. The raw files "
+            "already downloaded are unaffected.")
+    return 1
+
+
+def _recover_finish(args, log, state):
+    """The link works. Get the pictures off while it does."""
+    if args.no_download:
+        log.out("Link is good. Not downloading, as asked.")
+        return 0
+    log.out("Downloading while the link is good, gently.")
+    dl = argparse.Namespace(
+        out=args.out, images=None, force=False,
+        timeout=15000, retries=8, chunk=1024,
+        verbose=args.verbose, quiet=args.quiet, formats=args.formats,
+        video_formats=args.video_formats, jpeg_quality=args.jpeg_quality,
+        fps=args.fps, naming="continue", no_skip_duplicates=False,
+        delete_after=False, no_raw_subfolder=args.no_raw_subfolder)
+    return cmd_download(dl, log, state)
+
+
+def _recovery_ladder(args, path, depth):
+    """The remedies, cheapest and least destructive first."""
+    steps = []
+
+    steps.append({
+        "title": "Drain the endpoint and re-open",
+        "why": "A transfer that died partway can leave bytes queued, so the "
+               "next request reads stale data and fails. Costs nothing.",
+        "act": _step_drain,
+    })
+
+    quirks = _read_sysfs("/sys/module/usbcore/parameters/quirks")
+    if "%04x:%04x" % (VENDOR_ID, PRODUCT_ID) not in (quirks or ""):
+        steps.append({
+            "title": "Ask the kernel to go easy on it (needs sudo)",
+            "why": "DELAY_INIT and DELAY_CTRL_MSG give a slow device time to "
+                   "answer, and old_scheme_first assigns an address before "
+                   "reading descriptors, the order pre-USB-2.0 devices "
+                   "expect. This fixed 'disabled by hub (EMI?)' on this "
+                   "camera. Both reset at reboot.",
+            "act": _step_quirks,
+        })
+
+    steps.append({
+        "title": "Power-cycle it: unplug, wait a moment, plug back in",
+        "why": "The firmware can wedge while still enumerated, answering "
+               "every request with a stall. Clearing the halt, re-setting "
+               "the configuration and resetting the device were all tried "
+               "against this camera in that state and none revive it. Only "
+               "removing power does. Unplugging does not harm the stored "
+               "pictures; the batteries maintain them.",
+        "act": lambda log: _step_replug(log, None),
+    })
+
+    if depth is None or depth > 0:
+        ports = shallow_ports()
+        if ports:
+            where = "; ".join(
+                "bus %s %s port(s) %s%s" % (h["bus"], h["name"],
+                                            ", ".join(str(p) for p in h["free"]),
+                                            " (no hub)" if h["depth"] == 0 else
+                                            " (%d hub deep)" % h["depth"])
+                for h in ports)
+            steps.append({
+                "title": "Move it to a port with fewer hubs in the way",
+                "why": "This is a full-speed device from 2002, and every "
+                       "high-speed hub between it and the controller wraps "
+                       "its traffic in split transactions. Free ports, "
+                       "shallowest first: %s" % where,
+                "act": lambda log: _step_replug(log, "somewhere shallower"),
+            })
+
+    steps.append({
+        "title": "Try a different USB cable",
+        "why": "A -71 (EPROTO) error is a signal problem, and the kernel's "
+               "own guess is interference. A degraded cable works for tiny "
+               "control transfers and collapses under anything sustained, "
+               "which is exactly the pattern. Costs nothing but a cable.",
+        "act": lambda log: _step_replug(log, "with a different cable"),
+    })
+
+    steps.append({
+        "title": "Fresh batteries",
+        "why": "Last, because the pictures live in battery-backed SDRAM: "
+               "removing the batteries erases anything still on the camera, "
+               "irrecoverably.",
+        "destructive": True,
+        "act": lambda log: _step_replug(log, "with fresh batteries"),
+    })
+    return steps
+
+
+def _step_drain(log):
+    cam = Blink2(log)
+    try:
+        cam.open(handshake=False)
+        cam.drain()
+    except CameraError as exc:
+        log.debug("drain skipped: %s" % exc)
+    finally:
+        try:
+            cam.close()
+        except Exception:
+            pass
+
+
+def _step_quirks(log):
+    import subprocess
+    want = "%04x:%04x:gn" % (VENDOR_ID, PRODUCT_ID)
+    cmds = [["sh", "-c", "echo '%s' > /sys/module/usbcore/parameters/quirks"
+             % want],
+            ["sh", "-c",
+             "echo 1 > /sys/module/usbcore/parameters/old_scheme_first"]]
+    if os.geteuid() != 0:
+        if shutil.which("sudo") is None:
+            raise CameraError("sudo is not available; set them by hand")
+        cmds = [["sudo", "-n"] + c for c in cmds]
+    for c in cmds:
+        try:
+            p = subprocess.run(c, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, timeout=15)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise CameraError(str(exc))
+        if p.returncode != 0:
+            raise CameraError(
+                "could not write the kernel knobs without an interactive "
+                "password. Run these yourself, then re-run recover:\n"
+                "  echo '%s' | sudo tee /sys/module/usbcore/parameters/quirks\n"
+                "  echo 1 | sudo tee "
+                "/sys/module/usbcore/parameters/old_scheme_first" % want)
+    log.out("    set; they take effect on the next plug")
+    _step_replug(log, None)
+
+
+def _step_replug(log, where):
+    if where:
+        log.out("    Unplug the camera and plug it back in %s." % where)
+    else:
+        log.out("    Unplug the camera, wait a couple of seconds, plug it "
+                "back in.")
+    _await_change(log)
+
+
 def cmd_watch(args, log, state):
     """Download by itself whenever the camera appears.
 
@@ -3005,6 +3271,7 @@ examples:
   blinky delete --last 1            erase just the newest photo
   blinky decode ~/blink-pics/image0000.raw
   blinky convert ~/blink-pics       batch .pnm -> .png, originals kept
+  blinky recover                   work through the remedies when it is fussy
   blinky watch                     download by itself whenever it is plugged in
   blinky update                    check GitHub for a newer release
   blinky update --install          ... and install it
@@ -3053,6 +3320,19 @@ imageNNNN.avi is itself the untouched raw data.
                         "verified on disk (refused if anything failed, or if "
                         "--images selected only some of them)")
     p.set_defaults(func=cmd_download)
+
+    p = add_common_options(sub.add_parser(
+        "recover", help="work through the remedies when the camera is fussy"))
+    p.add_argument("--out", default=DEFAULT_OUTDIR, metavar="DIR",
+                   help="output directory (default %s)" % DEFAULT_OUTDIR)
+    p.add_argument("--no-download", action="store_true",
+                   help="just fix the link, do not download afterwards")
+    p.add_argument("--yes", action="store_true",
+                   help="allow the last resort, which erases the camera")
+    add_format_options(p)
+    p.add_argument("--no-raw-subfolder", action="store_true",
+                   help="keep the .raw files beside the pictures")
+    p.set_defaults(func=cmd_recover)
 
     p = add_common_options(sub.add_parser(
         "watch", help="download automatically whenever the camera appears"))

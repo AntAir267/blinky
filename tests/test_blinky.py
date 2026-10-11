@@ -1310,6 +1310,65 @@ def test_gui_watch_toggle():
     shutil.rmtree(w.outdir, ignore_errors=True)
 
 
+def test_recover_ladder():
+    section("recover: the remedies, ordered and conditional")
+    a = argparse.Namespace(out="/tmp", no_download=True, yes=False,
+                           formats="png", video_formats="avi",
+                           jpeg_quality=92, fps=5, no_raw_subfolder=False,
+                           verbose=False, quiet=True)
+
+    deep = blinky._recovery_ladder(a, "9-1.3.3.3", 3)
+    titles = [st["title"] for st in deep]
+    check("it starts with the free software remedy",
+          "Drain" in titles[0], titles[0])
+    check("the destructive one is last", "batteries" in titles[-1].lower(),
+          titles[-1])
+    check("and is marked destructive", deep[-1].get("destructive") is True)
+    check("nothing before it is destructive",
+          not any(st.get("destructive") for st in deep[:-1]),
+          [st["title"] for st in deep if st.get("destructive")])
+    check("a deep camera is told to move to a shallower port",
+          any("fewer hubs" in t for t in titles), titles)
+
+    shallow = [st["title"] for st in blinky._recovery_ladder(a, "5-2", 0)]
+    check("a camera already on a root port is not told to move it",
+          not any("fewer hubs" in t for t in shallow), shallow)
+
+    # The quirks rung should appear only when they are not already applied.
+    real_read = blinky._read_sysfs
+    blinky._read_sysfs = lambda path, default="": (
+        "" if "quirks" in path else real_read(path, default))
+    unset = [st["title"] for st in blinky._recovery_ladder(a, "5-2", 0)]
+    blinky._read_sysfs = lambda path, default="": (
+        "0c77:1011:gn" if "quirks" in path else real_read(path, default))
+    already = [st["title"] for st in blinky._recovery_ladder(a, "5-2", 0)]
+    blinky._read_sysfs = real_read
+    check("the kernel-knob rung appears when the knobs are unset",
+          any("kernel" in t for t in unset), unset)
+    check("and is skipped when they are already set",
+          not any("kernel" in t for t in already), already)
+
+    check("every rung explains itself",
+          all(st.get("why") and st.get("act") for st in deep))
+
+    # probe_link must report rather than raise when there is no camera.
+    real_present = blinky.camera_present
+    blinky.camera_present = lambda: False
+    ok, why = blinky.probe_link(Log(quiet=True))
+    check("probe_link reports a missing camera calmly",
+          ok is False and "not on the bus" in why, (ok, why))
+    blinky.camera_present = real_present
+
+    path, depth = blinky.camera_path()
+    check("camera_path returns a pair whether or not it finds one",
+          (path is None and depth is None) or isinstance(depth, int),
+          (path, depth))
+    ports = blinky.shallow_ports()
+    check("shallow_ports is sorted by depth",
+          [h["depth"] for h in ports] == sorted(h["depth"] for h in ports),
+          [h["depth"] for h in ports])
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -1364,6 +1423,7 @@ def main():
     test_hub_depth()
     test_watch(blobs)
     test_gui_watch_toggle()
+    test_recover_ladder()
     test_misc()
 
     print("\n%s" % ("-" * 60))

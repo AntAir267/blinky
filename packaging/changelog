@@ -1,3 +1,18 @@
+blinky (1.10-1) unstable; urgency=low
+
+  * Add `blinky recover`, which works the problem instead of describing it.
+    It tries each remedy in turn -- drain the endpoint, set the kernel
+    quirks, power-cycle, move to a shallower port, change the cable, and
+    only after asking, fresh batteries -- verifying with a handshake after
+    every one and stopping the moment the camera answers, then downloading
+    while the link is good.
+  * Rungs that cannot help are skipped: a camera already on a root port is
+    not told to move, and knobs already set are not set again.
+  * Steps needing a person state exactly what to do and then wait for the
+    camera to be unplugged and reconnected, rather than asking for a keypress.
+
+ -- antair <antairdo@gmail.com>  Fri, 10 Oct 2026 18:40:00 +0000
+
 blinky (1.9-1) unstable; urgency=low
 
   * The window can now turn automatic downloading on and off, controlling the

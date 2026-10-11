@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.9-1_all.deb
+sudo apt install ./packaging/blinky_1.10-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -118,6 +118,7 @@ and conveniently it is what Aqua did anyway.
 | `blinky download` | Fetch photos to `~/blink-pics`: raw bytes first, then decode |
 | `blinky decode RAW...` | Decode already-saved `.raw` files to PNG (no camera needed) |
 | `blinky delete` | Erase photos from the camera |
+| `blinky recover` | Work through the remedies when the camera is being fussy |
 | `blinky watch` | Download by itself whenever the camera is plugged in |
 | `blinky update` | Fetch a newer release from GitHub |
 | `blinky convert [PATH...]` | Batch-convert `.pnm` files to PNG (no camera needed) |
@@ -329,6 +330,34 @@ dies halfway simply resumes on the next plug — duplicate detection skips
 whatever is already saved, so nothing is fetched twice and every attempt gains
 ground. It notifies on the desktop when a download finishes or partially
 succeeds.
+
+## When it will not talk
+
+```bash
+blinky recover
+```
+
+`doctor` tells you what is wrong once. `recover` works the problem: it tries
+each remedy in turn, cheapest and least destructive first, and re-attempts the
+handshake after every one, stopping the moment the camera answers and then
+downloading while the link holds.
+
+The ladder, learned the hard way from a camera that fought back all day:
+
+1. **Drain the endpoint** — a transfer that died partway leaves bytes queued.
+2. **Set the kernel quirks** — `DELAY_INIT`, `DELAY_CTRL_MSG` and
+   `old_scheme_first`. Skipped if already set.
+3. **Power-cycle** — the only thing that revives wedged firmware;
+   `clear_halt`, `set_configuration` and `reset` were all measured useless.
+4. **Move to a port with fewer hubs** — naming the free ones, shallowest
+   first. Skipped if it is already on a root port.
+5. **Change the cable** — `-71` is a signal error, and a tired cable survives
+   control transfers but not sustained ones.
+6. **Fresh batteries** — last and only after asking, because it erases
+   anything still on the camera.
+
+Steps needing a person say precisely what to do, then wait for the camera to
+be unplugged and reconnected rather than asking you to press a key.
 
 ## The camera forgets
 

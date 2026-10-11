@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.9" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.10" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -33,6 +33,22 @@ with each entry's address range and size.
 .TP
 .B download
 Download photos. Raw bytes reach the disk before any decoding is attempted.
+.TP
+.B recover
+Work the problem rather than merely describe it. Tries each remedy in turn,
+cheapest and least destructive first, and verifies by attempting the handshake
+after every one, stopping the moment the camera answers and then downloading
+while the link is good.
+.PP
+The ladder: drain a half-finished transfer off the endpoint; set the kernel
+quirks, if they are not already set; power-cycle, which is the only thing that
+revives wedged firmware; move to a port with fewer hubs, naming the free ones;
+change the cable; and only then, after asking, fresh batteries. Rungs that do
+not apply are skipped, so a camera already on a root port is not told to move
+and knobs already set are not set again.
+.PP
+Steps needing a person say exactly what to do and then wait for the camera to
+be unplugged and reconnected, rather than asking you to press a key.
 .TP
 .B watch
 Sit waiting for the camera and download by itself whenever it appears. Written
@@ -162,6 +178,14 @@ Install the download. This runs \fBsudo apt install\fR.
 .TP
 .BI \-\-out " DIR"
 Where to put the download. Default: a temporary folder.
+.SH "RECOVER OPTIONS"
+.TP
+.B \-\-no\-download
+Repair the link but do not download afterwards.
+.TP
+.B \-\-yes
+Allow the last resort, fresh batteries, which erases anything still on the
+camera. Without it, recovery stops before that rung and asks.
 .SH "WATCH OPTIONS"
 .TP
 .B \-\-once
