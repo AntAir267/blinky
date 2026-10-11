@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.11"
+__version__ = "1.12"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -1922,6 +1922,39 @@ class RunState:
         self.results = []
         self.checks_ran = False
         self.offline = False
+        self.download = None        # {"total", "saved"} from the last download
+
+
+def watch_status_path():
+    base = (os.environ.get("XDG_STATE_HOME")
+            or os.path.expanduser("~/.local/state"))
+    return os.path.join(base, "blinky", "watch.json")
+
+
+def write_watch_status(log, **fields):
+    """Leave word of how the last background attempt went.
+
+    The background service has no window of its own, so this is how the
+    Blinky window learns that a download dropped out partway and offers to
+    walk through recovery.
+    """
+    import json
+    fields["time"] = time.time()
+    path = watch_status_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_file_atomically(path, json.dumps(fields).encode("utf-8"))
+    except OSError as exc:
+        log.debug("could not record the watch status: %s" % exc)
+
+
+def read_watch_status():
+    import json
+    try:
+        with open(watch_status_path(), "rb") as fh:
+            return json.loads(fh.read().decode("utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def _section(title):
@@ -2260,6 +2293,12 @@ def cmd_download(args, log, state):
                 % (len(wanted), len(entries), outdir))
         log.out("")
 
+        # How much of the camera is safe on disk, kept current as it goes so
+        # it is right even when the link dies partway.
+        progress = {"total": len(entries), "saved": 0}
+        if state is not None:
+            state.download = progress
+
         index = {} if args.no_skip_duplicates else local_fingerprints(outdir)
         if index:
             log.debug("%d file(s) already in %s are indexed by content"
@@ -2289,6 +2328,7 @@ def cmd_download(args, log, state):
                              % (entry.basename,
                                 os.path.basename(index[key])))
                     skipped.append(entry.basename)
+                    progress["saved"] += 1
                     continue
 
             if counter is None:
@@ -2357,6 +2397,7 @@ def cmd_download(args, log, state):
             saved.append(raw_path)
             verified[i] = (raw_path, len(data),
                            hashlib.sha256(data).hexdigest())
+            progress["saved"] += 1
 
             stem = os.path.splitext(os.path.basename(raw_path))[0]
             entry_is_movie = entry.is_movie
@@ -2510,27 +2551,85 @@ def _http_get(url, log, accept=None, timeout=20, allow_404=False):
         raise CameraError("could not reach %s: %s" % (url, exc))
 
 
+def latest_release(log):
+    """The newest published release, as (version, info).
+
+    (None, {}) when nothing has been published. Raises CameraError when
+    GitHub cannot be reached or answers with something unreadable.
+    """
+    import json
+    raw = _http_get(RELEASES_API, log, allow_404=True)
+    try:
+        info = json.loads(raw.decode("utf-8")) if raw else {}
+    except ValueError as exc:
+        raise CameraError("the release list was not readable: %s" % exc)
+    tag = str(info.get("tag_name") or "").strip()
+    return (tag.lstrip("v") or None), info
+
+
+def fetch_release_deb(info, log, require_sums=False):
+    """Download a release's .deb and check it against its SHA256SUMS.
+
+    Returns (filename, bytes). Installing a package is root-level trust, so
+    a truncated or swapped download raises CameraError here rather than
+    reach dpkg; nothing is written in that case.
+    """
+    assets = {a.get("name"): a for a in info.get("assets") or []}
+    deb = next((n for n in assets if n.endswith(".deb")), None)
+    if deb is None:
+        raise CameraError("release %s has no .deb attached; see %s"
+                          % (info.get("tag_name"), RELEASES_PAGE))
+
+    log.out("Downloading %s (%s KB)"
+            % (deb, "{:,}".format((assets[deb].get("size") or 0) // 1024)))
+    data = _http_get(assets[deb]["browser_download_url"], log,
+                     accept="application/octet-stream", timeout=120)
+
+    if "SHA256SUMS" not in assets:
+        if require_sums:
+            raise CameraError("release %s publishes no SHA256SUMS, so the "
+                              "download cannot be verified; not installing it"
+                              % info.get("tag_name"))
+        log.warn("this release publishes no SHA256SUMS, so the download "
+                 "could not be verified")
+        return deb, data
+
+    sums = _http_get(assets["SHA256SUMS"]["browser_download_url"], log,
+                     accept="application/octet-stream").decode("utf-8")
+    want = None
+    for line in sums.splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[1].lstrip("*") == deb:
+            want = bits[0]
+    if want is None:
+        raise CameraError("SHA256SUMS does not mention %s; refusing" % deb)
+    got = hashlib.sha256(data).hexdigest()
+    if want != got:
+        raise CameraError(
+            "checksum mismatch for %s\n  published:  %s\n  downloaded: %s\n"
+            "  Nothing was installed. Try again, and if it persists report "
+            "it at %s" % (deb, want, got, RELEASES_PAGE))
+    log.out("  checksum verified against the release's SHA256SUMS")
+    return deb, data
+
+
 def cmd_update(args, log, state):
     """Check GitHub for a newer release, fetch it, and verify it."""
     state.offline = True
-    import json
 
     log.out("Installed: blinky %s" % __version__)
     try:
-        raw = _http_get(RELEASES_API, log, allow_404=True)
-        info = json.loads(raw.decode("utf-8")) if raw else {}
-    except (CameraError, ValueError) as exc:
+        latest, info = latest_release(log)
+    except CameraError as exc:
         log.error(str(exc))
         log.info("  Releases are listed at %s" % RELEASES_PAGE)
         return 1
 
-    tag = str(info.get("tag_name") or "").strip()
-    if not tag:
+    if not latest:
         log.out("")
         log.out("No releases have been published yet.")
         log.info("  %s" % RELEASES_PAGE)
         return 0
-    latest = tag.lstrip("v")
     log.out("Latest:    blinky %s" % latest)
 
     if version_tuple(latest) <= version_tuple(__version__):
@@ -2546,53 +2645,19 @@ def cmd_update(args, log, state):
             log.out("  %s" % line)
         log.out("")
     if args.check:
-        log.out("Run 'blinky update' to fetch it.")
+        log.out("Run 'blinky update --install' to install it.")
         return 0
 
-    assets = {a.get("name"): a for a in info.get("assets") or []}
-    deb = next((n for n in assets if n.endswith(".deb")), None)
-    if deb is None:
-        log.error("release %s has no .deb attached" % tag)
-        log.info("  See %s" % RELEASES_PAGE)
+    try:
+        deb, data = fetch_release_deb(info, log)
+    except CameraError as exc:
+        log.error(str(exc))
         return 1
 
     outdir = os.path.expanduser(args.out) if args.out else tempfile.mkdtemp(
         prefix="blinky-update-")
     os.makedirs(outdir, exist_ok=True)
     path = os.path.join(outdir, deb)
-
-    log.out("Downloading %s (%s KB)"
-            % (deb, "{:,}".format((assets[deb].get("size") or 0) // 1024)))
-    data = _http_get(assets[deb]["browser_download_url"], log,
-                     accept="application/octet-stream", timeout=120)
-
-    # Verify against the checksums published with the release. Installing a
-    # package is root-level trust, so a truncated or swapped download should
-    # stop here rather than reach dpkg.
-    if "SHA256SUMS" in assets:
-        sums = _http_get(assets["SHA256SUMS"]["browser_download_url"], log,
-                         accept="application/octet-stream").decode("utf-8")
-        want = None
-        for line in sums.splitlines():
-            bits = line.split()
-            if len(bits) == 2 and bits[1].lstrip("*") == deb:
-                want = bits[0]
-        got = hashlib.sha256(data).hexdigest()
-        if want is None:
-            log.error("SHA256SUMS does not mention %s; refusing" % deb)
-            return 1
-        if want != got:
-            log.error("checksum mismatch for %s" % deb)
-            log.info("  published: %s" % want)
-            log.info("  downloaded: %s" % got)
-            log.info("  Nothing was installed. Try again, and if it persists "
-                     "report it at %s" % RELEASES_PAGE)
-            return 1
-        log.out("  checksum verified against the release's SHA256SUMS")
-    else:
-        log.warn("this release publishes no SHA256SUMS, so the download "
-                 "could not be verified")
-
     write_file_atomically(path, data)
     log.out("  saved to %s" % path)
 
@@ -2600,9 +2665,10 @@ def cmd_update(args, log, state):
     cmd = [c for c in cmd if c]
     if not args.install:
         log.out("")
-        log.out("To install it:")
+        log.out("Downloaded, not installed. To install it:")
         log.out("  sudo apt install %s" % path)
-        log.out("Then close and reopen the Blinky window if it is running.")
+        log.out("(or next time run 'blinky update --install', or press "
+                "Update in the Blinky window)")
         return 0
 
     log.out("")
@@ -2796,25 +2862,28 @@ def _recovery_ladder(args, path, depth):
     steps = []
 
     steps.append({
+        "kind": "drain",
         "title": "Drain the endpoint and re-open",
         "why": "A transfer that died partway can leave bytes queued, so the "
                "next request reads stale data and fails. Costs nothing.",
         "act": _step_drain,
     })
 
-    quirks = _read_sysfs("/sys/module/usbcore/parameters/quirks")
-    if "%04x:%04x" % (VENDOR_ID, PRODUCT_ID) not in (quirks or ""):
+    if not quirks_applied():
         steps.append({
+            "kind": "quirks",
             "title": "Ask the kernel to go easy on it (needs sudo)",
             "why": "DELAY_INIT and DELAY_CTRL_MSG give a slow device time to "
                    "answer, and old_scheme_first assigns an address before "
                    "reading descriptors, the order pre-USB-2.0 devices "
                    "expect. This fixed 'disabled by hub (EMI?)' on this "
                    "camera. Both reset at reboot.",
+            "do": REPLUG_PLAIN,
             "act": _step_quirks,
         })
 
     steps.append({
+        "kind": "replug",
         "title": "Power-cycle it: unplug, wait a moment, plug back in",
         "why": "The firmware can wedge while still enumerated, answering "
                "every request with a stall. Clearing the halt, re-setting "
@@ -2822,15 +2891,17 @@ def _recovery_ladder(args, path, depth):
                "against this camera in that state and none revive it. Only "
                "removing power does. Unplugging does not harm the stored "
                "pictures; the batteries maintain them.",
-        "act": lambda log: _step_replug(log, None),
+        "do": REPLUG_PLAIN,
+        "act": lambda log: _step_replug(log, REPLUG_PLAIN),
     })
 
     if depth is None or depth > 0:
         # The depth itself is the diagnosis, so say so even when no free port
         # can be named: the answer may be to unplug something else.
-        why = ("This is a full-speed device from 2002, and every high-speed "
-               "hub between it and the controller wraps its traffic in split "
-               "transactions. ")
+        reason = ("This is a full-speed device from 2002, and every "
+                  "high-speed hub between it and the controller wraps its "
+                  "traffic in split transactions. ")
+        why = reason
         ports = shallow_ports()
         if ports:
             why += "Free ports, best first: " + "; ".join(
@@ -2841,28 +2912,44 @@ def _recovery_ladder(args, path, depth):
         else:
             why += ("Nothing is free to move it to, so unplug something else "
                     "from a port closer to the machine and use that.")
+        do = ("Unplug the camera and plug it into the first port listed."
+              if ports else "Unplug the camera and plug it in closer to the "
+                            "computer.")
         steps.append({
+            "kind": "replug",
             "title": "Move it to a port with fewer hubs in the way",
             "why": why,
-            "act": lambda log: _step_replug(log, "somewhere shallower"),
+            # The window draws the ports as a list rather than a sentence.
+            "reason": reason.strip(),
+            "ports": ports,
+            "do": do,
+            "act": lambda log: _step_replug(log, do),
         })
 
     steps.append({
+        "kind": "replug",
         "title": "Try a different USB cable",
         "why": "A -71 (EPROTO) error is a signal problem, and the kernel's "
                "own guess is interference. A degraded cable works for tiny "
                "control transfers and collapses under anything sustained, "
                "which is exactly the pattern. Costs nothing but a cable.",
-        "act": lambda log: _step_replug(log, "with a different cable"),
+        "do": "Unplug the camera, change the cable, and plug it back in.",
+        "act": lambda log: _step_replug(
+            log, "Unplug the camera, change the cable, and plug it back in."),
     })
 
     steps.append({
+        "kind": "replug",
         "title": "Fresh batteries",
         "why": "Last, because the pictures live in battery-backed SDRAM: "
                "removing the batteries erases anything still on the camera, "
                "irrecoverably.",
         "destructive": True,
-        "act": lambda log: _step_replug(log, "with fresh batteries"),
+        "do": "Unplug the camera, put in fresh batteries, and plug it back "
+              "in.",
+        "act": lambda log: _step_replug(
+            log, "Unplug the camera, put in fresh batteries, and plug it back "
+                 "in."),
     })
     return steps
 
@@ -2881,13 +2968,43 @@ def _step_drain(log):
             pass
 
 
+QUIRKS_PARAM = "/sys/module/usbcore/parameters/quirks"
+OLD_SCHEME_PARAM = "/sys/module/usbcore/parameters/old_scheme_first"
+REPLUG_PLAIN = ("Unplug the camera, wait a couple of seconds, and plug it "
+                "back in.")
+
+
+def quirks_applied():
+    """Are DELAY_INIT and DELAY_CTRL_MSG already set for this camera?"""
+    return ("%04x:%04x" % (VENDOR_ID, PRODUCT_ID)
+            in (_read_sysfs(QUIRKS_PARAM) or "").lower())
+
+
+def quirks_value():
+    """The quirks list with ours added, keeping anyone else's entries.
+
+    The parameter is one comma-separated list for every device, so writing
+    just our entry would silently drop a quirk someone set for something
+    else.
+    """
+    ours = "%04x:%04x:" % (VENDOR_ID, PRODUCT_ID)
+    have = (_read_sysfs(QUIRKS_PARAM) or "").strip()
+    keep = [q for q in have.split(",")
+            if re.match(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}:[a-zA-Z]*$", q)
+            and not q.lower().startswith(ours)]
+    return ",".join(keep + [ours + "gn"])
+
+
+def quirks_script():
+    """Shell that sets both kernel knobs. Run it as root."""
+    return "echo '%s' > %s && echo 1 > %s" % (quirks_value(), QUIRKS_PARAM,
+                                             OLD_SCHEME_PARAM)
+
+
 def _step_quirks(log):
     import subprocess
-    want = "%04x:%04x:gn" % (VENDOR_ID, PRODUCT_ID)
-    cmds = [["sh", "-c", "echo '%s' > /sys/module/usbcore/parameters/quirks"
-             % want],
-            ["sh", "-c",
-             "echo 1 > /sys/module/usbcore/parameters/old_scheme_first"]]
+    want = quirks_value()
+    cmds = [["sh", "-c", quirks_script()]]
     if os.geteuid() != 0:
         if shutil.which("sudo") is None:
             raise CameraError("sudo is not available; set them by hand")
@@ -2902,19 +3019,15 @@ def _step_quirks(log):
             raise CameraError(
                 "could not write the kernel knobs without an interactive "
                 "password. Run these yourself, then re-run recover:\n"
-                "  echo '%s' | sudo tee /sys/module/usbcore/parameters/quirks\n"
-                "  echo 1 | sudo tee "
-                "/sys/module/usbcore/parameters/old_scheme_first" % want)
+                "  echo '%s' | sudo tee %s\n"
+                "  echo 1 | sudo tee %s" % (want, QUIRKS_PARAM,
+                                            OLD_SCHEME_PARAM))
     log.out("    set; they take effect on the next plug")
-    _step_replug(log, None)
+    _step_replug(log, REPLUG_PLAIN)
 
 
-def _step_replug(log, where):
-    if where:
-        log.out("    Unplug the camera and plug it back in %s." % where)
-    else:
-        log.out("    Unplug the camera, wait a couple of seconds, plug it "
-                "back in.")
+def _step_replug(log, do):
+    log.out("    %s" % do)
     _await_change(log)
 
 
@@ -2955,12 +3068,24 @@ def cmd_watch(args, log, state):
                 naming="continue", no_skip_duplicates=False,
                 delete_after=False, no_raw_subfolder=args.no_raw_subfolder)
             log.out("--- attempt %d ---" % rounds)
+            state.download = None
             try:
                 rc = cmd_download(dl, log, state)
             except CameraError as exc:
                 log.error(str(exc))
                 rc = 1
             gained = len(local_fingerprints(outdir)) - before
+
+            got = state.download or {}
+            total, held = got.get("total"), got.get("saved")
+            # A photo whose JPEG is damaged in the camera fails to decode but
+            # is saved all the same; that is not something replugging fixes.
+            whole = rc == 0 or (total is not None and held is not None
+                                and held >= total)
+            write_watch_status(
+                log, result="complete" if whole
+                else ("partial" if gained else "nothing"),
+                total=total, saved=held, gained=gained, outdir=outdir)
 
             if rc == 0:
                 log.out("Everything on the camera is saved.")

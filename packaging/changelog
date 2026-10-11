@@ -1,3 +1,24 @@
+blinky (1.12-1) unstable; urgency=low
+
+  * Recovery in the window: when a download dies partway, a Recover button
+    appears and walks through unplugging and replugging, saving more each
+    round and carrying on from where the link dropped, until every photo is
+    off the camera. Remedies are suggested only when a round gets nothing,
+    and fresh batteries never are.
+  * The background service records each attempt, so the Recover button also
+    appears when the service is the one whose download dropped out.
+  * An Update button in the window: it finds a newer release, verifies the
+    package against SHA256SUMS, installs it through the desktop's password
+    prompt, and offers to restart. Releases without checksums are refused.
+  * A download in the window now stops when the camera disappears or wedges,
+    instead of failing every remaining photo one slow retry at a time.
+  * Writing the kernel quirks keeps any other device's entries rather than
+    replacing the whole list.
+  * 'blinky update --check' now points at --install, and plain 'blinky
+    update' says plainly that it downloaded without installing.
+
+ -- antair <antairdo@gmail.com>  Sat, 10 Oct 2026 23:40:00 +0000
+
 blinky (1.11-1) unstable; urgency=low
 
   * Rank suggested ports by transaction translator as well as depth. A

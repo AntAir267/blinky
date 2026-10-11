@@ -16,6 +16,7 @@ import hashlib
 import os
 import shutil
 import sys
+import tempfile
 import time
 
 from PyQt6.QtCore import (QPoint, QPointF, QRect, QRectF, QSize, Qt, QThread,
@@ -995,14 +996,18 @@ class Job(QThread):
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self.fn = fn
+        self.exc = None             # what went wrong, for the caller to judge
+        self.cancel = False         # checked between photos by long jobs
 
     def run(self):
         log = GuiLog(self.line.emit)
         try:
             self.ok.emit(self.fn(self, log))
         except blinky.CameraError as exc:
+            self.exc = exc
             self.failed.emit(str(exc))
         except Exception as exc:                       # never kill the UI
+            self.exc = exc
             self.failed.emit("%s: %s" % (type(exc).__name__, exc))
 
 
@@ -1221,6 +1226,766 @@ class ConfirmDialog(QDialog):
         p.drawPath(path)
 
 
+# A replug is the real retry during recovery, so do not spend minutes on
+# in-place retries against a link that has already died. Small reads and a
+# long timeout are what got photos through when the link was at its worst.
+RECOVERY_TUNING = dict(timeout=10000, chunk=1024, retries=2)
+
+
+def is_link_trouble(exc):
+    """Is this the link misbehaving, as opposed to something else wrong?
+
+    A camera that is absent, already claimed, or not ours to open needs
+    plugging in, the other program closing, or the udev rule -- replugging
+    over and over will not help. Anything else from the USB layer is the
+    link, which is what recovery is for.
+    """
+    return (isinstance(exc, blinky.CameraError)
+            and not isinstance(exc, (blinky.PermissionDenied,
+                                     blinky.DeviceBusy, blinky.NotPresent)))
+
+
+def already_saved(cam, entry, index, sizes):
+    """The local file that holds this photo, or None.
+
+    Decided by content: the camera renumbers from zero after an erase, so
+    image0000 on the camera and image0000 in the folder are routinely
+    different photos. The prefix read is only paid for when some local file
+    is the right size to be this photo in the first place.
+    """
+    if not index or entry.data_bytes not in sizes:
+        return None
+    try:
+        return index.get(cam.fingerprint(entry))
+    except blinky.CameraError:
+        return None
+
+
+def save_photo(data, entry, stem, outdir, dirs, still_formats, video_formats,
+               quality, log):
+    """Write the raw bytes, then the picture or clip made from them.
+
+    Returns (state, raw_path, problem), where state is "done", "partial" or
+    "failed". The raw file lands first, so even a failure here leaves the
+    camera's exact bytes on disk.
+    """
+    # free_path is a belt-and-braces guard: the counter should already be
+    # past anything on disk, but overwriting a photo is not worth risking.
+    raw = blinky.free_path(os.path.join(dirs["raw"], stem + ".raw"))
+    stem = os.path.splitext(os.path.basename(raw))[0]
+    blinky.write_file_atomically(raw, data)
+
+    # A clip of one frame is a photograph, so decide from the bytes rather
+    # than the directory flag alone.
+    is_clip = (entry.is_movie
+               and (blinky.movie_extension(data)[1]
+                    or len(blinky.split_clip_frames(data)) > 1))
+    if is_clip:
+        try:
+            n, w, h, made = blinky.build_clip(data, dirs, stem, log,
+                                              video_formats)
+            log.out("%s: %d frame%s at %dx%d -> %s"
+                    % (entry.basename, n, "" if n == 1 else "s", w, h,
+                       ", ".join(os.path.basename(m) for m in made)))
+            return "done", raw, None
+        except blinky.CameraError as exc:
+            log.error("%s: could not build a video: %s" % (entry.basename, exc))
+            log.info("the camera's bytes are kept at %s" % raw)
+            return "failed", raw, str(exc)
+    try:
+        w, h, raster, part = blinky.decode_still(data, log)
+        blinky.write_still(outdir, stem, w, h, raster, still_formats, quality)
+        return ("partial" if part else "done"), raw, None
+    except blinky.CameraError as exc:
+        log.error("%s: decode failed: %s" % (entry.basename, exc))
+        log.info("the raw data is kept at %s" % raw)
+        return "failed", raw, "decode: %s" % exc
+
+
+def extract_round(job, log, opts):
+    """One plug's worth of recovery: save what is missing until the link dies.
+
+    Stops at the first photo that will not come through rather than trying
+    the rest, because on this camera the rest fail the same way, slowly.
+    Whatever made it is on disk, and the next round skips it by content.
+    """
+    outdir = opts["outdir"]
+    dirs = blinky.output_dirs(outdir)
+    os.makedirs(dirs["raw"], exist_ok=True)
+    result = {"total": None, "had": 0, "gained": 0, "error": None,
+              "stopped_at": None, "damaged": [], "cancelled": False}
+    # A transfer that died partway can leave bytes queued on the endpoint.
+    blinky._step_drain(log)
+    cam = blinky.Blink2(log, **RECOVERY_TUNING)
+    try:
+        cam.open()
+        n = cam.get_numpics()
+        result["total"] = n
+        entries = cam.get_directory(n)[0] if n else []
+        index = blinky.local_fingerprints(outdir)
+        sizes = {sz for sz, _ in index}
+        missing = []
+        for e in entries:
+            if already_saved(cam, e, index, sizes):
+                result["had"] += 1
+            else:
+                missing.append(e)
+        counter = blinky.next_free_index(outdir)
+        for k, e in enumerate(missing):
+            if job.cancel:
+                result["cancelled"] = True
+                break
+            job.step.emit((result["had"] + result["gained"]) / float(n),
+                          "Reading %s — %d to go" % (e.basename,
+                                                           len(missing) - k))
+            try:
+                data = cam.read_image_with_retries(e)
+            except blinky.CameraError as exc:
+                result["error"] = str(exc)
+                result["stopped_at"] = e.basename
+                break
+            state, _, _ = save_photo(data, e, "image%04d" % counter, outdir,
+                                     dirs, opts["still_formats"],
+                                     opts["video_formats"], opts["quality"],
+                                     log)
+            counter += 1
+            # The raw bytes are safe even when the picture is not, and the
+            # next round must not fetch this photo again.
+            result["gained"] += 1
+            if state != "done":
+                result["damaged"].append(e.basename)
+    except blinky.CameraError as exc:
+        result["error"] = str(exc)
+    finally:
+        cam.close()
+    return result
+
+
+def _where_text(path, depth):
+    if path is None:
+        return "Not plugged in"
+    if depth == 0:
+        return "At %s, plugged straight into the computer" % path
+    return "At %s, %d hub%s in the way" % (path, depth,
+                                           "" if depth == 1 else "s")
+
+
+def _first_line(text, limit=110):
+    text = str(text).strip()
+    line = text.splitlines()[0] if text else ""
+    return line if len(line) <= limit else line[:limit - 1] + "…"
+
+
+def ports_html(ports):
+    """The ranked free ports as a short list a person can act on."""
+    if not ports:
+        return ("Nothing is free closer to the computer. Unplug something "
+                "else from a port on the computer itself and use that.")
+    lines = []
+    for n, h in enumerate(ports):
+        nums = ", ".join(str(p) for p in h["free"])
+        plural = "s" if len(h["free"]) > 1 else ""
+        if h["depth"] == 0:
+            place = "Bus %s, port%s %s on the computer itself" % (
+                h["bus"], plural, nums)
+        else:
+            place = "Hub %s, port%s %s" % (h["name"], plural, nums)
+        lines.append("%s<b>%s</b> &nbsp;<span style='color:#5B6C7D'>%s</span>"
+                     % ("★ " if n == 0 else "• ", place,
+                        blinky.port_summary(h)))
+    return "Free ports, best first:<br>" + "<br>".join(lines)
+
+
+class RoundRow(QWidget):
+    """One line of the recovery history: a bead and what that plug got."""
+
+    def __init__(self, number, text, good, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setSpacing(8)
+        led = StatusLed(self)
+        led.set_state("ok" if good else "bad")
+        lay.addWidget(led)
+        tag = QLabel("Round %d" % number, self)
+        tag.setFont(ui_font(8, bold=True))
+        tag.setStyleSheet("color:#20303F;")
+        tag.setFixedWidth(62)
+        lay.addWidget(tag)
+        msg = ElidedLabel(text, Qt.TextElideMode.ElideRight, self)
+        msg.setFont(ui_font(8))
+        msg.setStyleSheet("color:#3A4B5C;")
+        lay.addWidget(msg, 1)
+
+
+def release_highlight(body, limit=150):
+    """The first change in a release's notes, as one plain sentence.
+
+    The notes are the package changelog stanza, whose first line is a
+    version header nobody needs to read; the first bullet says what changed.
+    """
+    lines, grabbing = [], False
+    for raw in (body or "").splitlines():
+        text = raw.strip()
+        if text.startswith(("* ", "- ")):
+            if grabbing:
+                break
+            grabbing = True
+            text = text[2:]
+        elif not text or text.startswith("--"):
+            if grabbing:
+                break
+            continue
+        if grabbing:
+            lines.append(text)
+    out = " ".join(lines)
+    return out if len(out) <= limit else out[:limit - 1].rstrip() + "\u2026"
+
+
+class Balloon(QFrame):
+    """An XP notification balloon: a tinted strip, a glyph, one button.
+
+    It stays hidden until there is something worth saying, and says it in
+    the window rather than in a popup that has to be dismissed.
+    """
+
+    clicked = pyqtSignal()
+
+    TINTS = {
+        "warn": ("\u26a0", "#C98B00", "#5B4A1A", ("#FFFFF0", "#FFF4C4"),
+                 "#D9B54A"),
+        "info": ("\u2605", "#1462C8", "#203A5C", ("#F6FBFF", "#DCEBFB"),
+                 "#8FB6DE"),
+    }
+
+    def __init__(self, tint, button, body="", kind="candy", parent=None):
+        super().__init__(parent)
+        glyph_text, glyph_ink, body_ink, self.fill, self.rim = self.TINTS[tint]
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 9, 8)
+        lay.setSpacing(10)
+        glyph = QLabel(glyph_text, self)
+        glyph.setFont(ui_font(13, bold=True))
+        glyph.setStyleSheet("color:%s; background:transparent;" % glyph_ink)
+        lay.addWidget(glyph)
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        self.head = QLabel("", self)
+        self.head.setFont(ui_font(8, bold=True))
+        self.head.setStyleSheet("color:#20303F; background:transparent;")
+        self.head.setWordWrap(True)
+        col.addWidget(self.head)
+        self.body = QLabel(body, self)
+        self.body.setFont(ui_font(8))
+        self.body.setStyleSheet("color:%s; background:transparent;" % body_ink)
+        self.body.setWordWrap(True)
+        col.addWidget(self.body)
+        lay.addLayout(col, 1)
+        self.button = GelButton(button, kind, self, width=96)
+        self.button.clicked.connect(self.clicked)
+        lay.addWidget(self.button)
+        self.hide()
+
+    def set_button(self, text, enabled=True):
+        self.button.text = text
+        self.button.setEnabled(enabled)
+        self.button.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+        p.fillPath(path, QBrush(vgrad(r, [(0.0, self.fill[0]),
+                                          (1.0, self.fill[1])])))
+        p.setPen(QPen(QColor(self.rim), 1))
+        p.drawPath(path)
+
+
+class RecoveryDialog(QDialog):
+    """Get the photos off a camera whose link keeps dying.
+
+    This is the routine that worked by hand: download until the link drops,
+    unplug, plug back in, carry on from where it stopped, and repeat until
+    everything is saved. The dialog watches the bus, so the only thing the
+    person does is the unplugging and plugging; each round starts by itself.
+    When a round gets nothing, it suggests the next remedy -- the kernel
+    settings, a better port, another cable -- but never the batteries, which
+    would erase the very photos this is trying to save.
+    """
+
+    POLL_MS = 700
+    SETTLE_MS = 3000            # the camera is unhappy if spoken to at once
+    HISTORY = 4
+
+    def __init__(self, opts, sink=None, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
+                            Qt.WindowType.Dialog)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self.opts = opts
+        self.sink = sink
+        self.round = 0
+        self.barren = 0
+        self.total = None
+        self.saved = 0
+        self.phase = "start"
+        self.outcome = None
+        self.job = None
+        self.tip = None
+        self._tips_shown = set()
+        self._closing = False
+
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+        bar = TitleBar("Camera Recovery", self)
+        bar.close_clicked.connect(self.reject)
+        bar.minimise_clicked.connect(self.reject)
+        bar.zoom_clicked.connect(lambda: None)
+        box.addWidget(bar)
+
+        panel = QWidget(self)
+        box.addWidget(panel, 1)
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(15, 13, 15, 13)
+        lay.setSpacing(10)
+
+        # -- the score -------------------------------------------------------
+        head = QHBoxLayout()
+        head.setSpacing(11)
+        head.addWidget(CameraGlyph(30, panel))
+        col = QVBoxLayout()
+        col.setSpacing(2)
+        top = QHBoxLayout()
+        top.setSpacing(7)
+        self.led = StatusLed(panel)
+        top.addWidget(self.led)
+        self.state = QLabel("Getting ready…", panel)
+        self.state.setFont(ui_font(9, bold=True))
+        self.state.setStyleSheet("color:#20303F;")
+        top.addWidget(self.state, 1)
+        col.addLayout(top)
+        self.detail = ElidedLabel("", Qt.TextElideMode.ElideRight, panel)
+        self.detail.setFont(ui_font(8))
+        self.detail.setStyleSheet("color:#5B6C7D;")
+        col.addWidget(self.detail)
+        self.where = ElidedLabel("", Qt.TextElideMode.ElideRight, panel)
+        self.where.setFont(ui_font(8))
+        self.where.setStyleSheet("color:#5B6C7D;")
+        col.addWidget(self.where)
+        head.addLayout(col, 1)
+        lay.addLayout(head)
+        self.meter = BarberPole(panel)
+        lay.addWidget(self.meter)
+
+        # -- what to do now --------------------------------------------------
+        self.card = LunaGroup("Round 1", panel)
+        self.todo = QLabel("", panel)
+        self.todo.setFont(ui_font(9, bold=True))
+        self.todo.setStyleSheet("color:#12447E;")
+        self.todo.setWordWrap(True)
+        self.todo.setMinimumWidth(410)
+        self.card.addWidget(self.todo)
+        prog = QHBoxLayout()
+        prog.setSpacing(7)
+        self.pled = StatusLed(panel)
+        prog.addWidget(self.pled)
+        self.progress = QLabel("", panel)
+        self.progress.setFont(ui_font(8))
+        self.progress.setStyleSheet("color:#20303F;")
+        self.progress.setWordWrap(True)
+        prog.addWidget(self.progress, 1)
+        self.card.addLayout(prog)
+        lay.addWidget(self.card)
+
+        # -- a remedy, when plugging alone is getting nowhere ----------------
+        self.tipcard = LunaGroup("Nothing came through — try this", panel)
+        self.tiptitle = QLabel("", panel)
+        self.tiptitle.setFont(ui_font(9, bold=True))
+        self.tiptitle.setStyleSheet("color:#20303F;")
+        self.tiptitle.setWordWrap(True)
+        self.tipcard.addWidget(self.tiptitle)
+        self.tipwhy = QLabel("", panel)
+        self.tipwhy.setFont(ui_font(8))
+        self.tipwhy.setStyleSheet("color:#3A4B5C;")
+        self.tipwhy.setWordWrap(True)
+        self.tipcard.addWidget(self.tipwhy)
+        self.tipports = QLabel("", panel)
+        self.tipports.setFont(ui_font(8))
+        self.tipports.setTextFormat(Qt.TextFormat.RichText)
+        self.tipports.setWordWrap(True)
+        self.tipports.setStyleSheet(
+            "color:#20303F; background:#F3F7FC; border:1px solid #C9D6E5;"
+            " border-radius:4px; padding:5px 8px;")
+        self.tipcard.addWidget(self.tipports)
+        tiprow = QHBoxLayout()
+        tiprow.addStretch(1)
+        self.btn_tip = GelButton("Set Them…", "candy", panel, width=120)
+        self.btn_tip.clicked.connect(self._set_quirks)
+        tiprow.addWidget(self.btn_tip)
+        self.tipcard.addLayout(tiprow)
+        self.tipcard.hide()
+        lay.addWidget(self.tipcard)
+
+        # -- how each plug went ----------------------------------------------
+        self.history = LunaGroup("Rounds", panel)
+        self.history_box = QVBoxLayout()
+        self.history_box.setSpacing(3)
+        self.history.addLayout(self.history_box)
+        self.history.hide()
+        lay.addWidget(self.history)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self.btn_close = GelButton("Stop", "grey", panel)
+        self.btn_close.clicked.connect(self.reject)
+        foot.addWidget(self.btn_close)
+        self.btn_done = GelButton("Done", "blue", panel)
+        self.btn_done.clicked.connect(self.accept)
+        self.btn_done.hide()
+        foot.addWidget(self.btn_done)
+        lay.addLayout(foot)
+
+        self._poll = QTimer(self)
+        self._poll.timeout.connect(self._tick)
+        self.setMinimumWidth(470)
+        self.adjustSize()
+
+    # -- running it --------------------------------------------------------
+
+    def run(self):
+        """Show it centred on the parent; returns 'done', 'partial' or None."""
+        self.adjustSize()
+        parent = self.parentWidget()
+        if parent is not None:
+            centre = parent.frameGeometry().center()
+            self.move(centre.x() - self.width() // 2,
+                      centre.y() - self.height() // 2)
+        QTimer.singleShot(0, self._begin)
+        self.exec()
+        return self.outcome
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.adjustSize()
+
+    def reject(self):
+        # Never tear down a worker mid-photo: let it finish the one it is
+        # reading, so nothing is left half-written, then close.
+        self._closing = True
+        self._poll.stop()
+        if self.job is not None and self.job.isRunning():
+            self.job.cancel = True
+            self.progress.setText("Finishing the photo in progress, then "
+                                  "stopping…")
+            return
+        super().reject()
+
+    def _begin(self):
+        self._show_where()
+        if blinky.camera_present():
+            # Worth one try straight away: a fresh open is sometimes enough.
+            self._start_round()
+        else:
+            self._await("Plug the camera in.", start="plug")
+
+    def _show_where(self):
+        path, depth = blinky.camera_path()
+        self.where.setText(_where_text(path, depth))
+        return path, depth
+
+    def _score(self):
+        if self.total:
+            self.state.setText("%d of %d photo%s saved"
+                               % (self.saved, self.total,
+                                  "" if self.total == 1 else "s"))
+            self.meter.set_value(self.saved / float(self.total))
+
+    # -- a round -------------------------------------------------------------
+
+    def _start_round(self):
+        if self._closing:
+            return
+        self.round += 1
+        self.phase = "round"
+        self.card.title = "Round %d" % self.round
+        self.card.update()
+        self.todo.setText("Leave it plugged in.")
+        self.pled.set_state("busy")
+        self.progress.setText("Talking to the camera…")
+        self.led.set_state("busy")
+        if not self.total:
+            self.state.setText("Reading the camera…")
+        job = Job(lambda job, log: extract_round(job, log, self.opts), self)
+        job.cancel = False
+        if self.sink is not None:
+            job.line.connect(self.sink)
+        job.step.connect(self._on_step)
+        job.ok.connect(self._round_done)
+        job.failed.connect(self._round_failed)
+        job.finished.connect(self._job_finished)
+        self.job = job
+        job.start()
+
+    def _on_step(self, frac, caption):
+        self.meter.set_value(frac)
+        if caption:
+            self.progress.setText(caption)
+
+    def _job_finished(self):
+        if self.sender() is not self.job:
+            return
+        if self._closing:
+            super().reject()
+
+    def _round_failed(self, message):
+        # extract_round reports camera trouble in its result; an exception
+        # here is something else entirely (a full disk, say). Stop, loudly.
+        self.led.set_state("bad")
+        self.state.setText("Recovery stopped")
+        self.detail.setText(_first_line(message))
+        self.pled.set_state("bad")
+        self.progress.setText(message)
+        if self.sink is not None:
+            self.sink("error", message)
+        self.btn_close.text = "Close"
+        self.btn_close.update()
+
+    def _round_done(self, r):
+        self._show_where()
+        if r["total"] is not None:
+            self.total = r["total"]
+            self.saved = r["had"] + r["gained"]
+        self._score()
+
+        if r["total"] == 0:
+            self._finish("The camera is empty", "There is nothing on it to "
+                         "recover.")
+            return
+        if r["cancelled"]:
+            return
+        if r["total"] is not None and self.saved >= r["total"]:
+            self._log_round("%s saved — that was the last of them"
+                            % r["gained"] if r["gained"] else
+                            "everything was already saved", True)
+            self._finish("All %d photo%s are saved"
+                         % (self.total, "" if self.total == 1 else "s"),
+                         "Everything on the camera is now in %s." %
+                         self._pretty(self.opts["outdir"]))
+            return
+
+        if r["gained"]:
+            self.barren = 0
+            what = "%d saved" % r["gained"]
+            if r["stopped_at"]:
+                what += ", then the link dropped at %s" % r["stopped_at"]
+            self._log_round(what, True)
+            self.detail.setText("Round %d: %s" % (self.round, what))
+            self._hide_tip()
+        else:
+            self.barren += 1
+            why = _first_line(r["error"] or "nothing new", 80)
+            self._log_round("nothing new — %s" % why, False)
+            self.detail.setText("Round %d got nothing: %s" % (self.round, why))
+            self._show_next_tip()
+        self.led.set_state("bad")
+        self._await(self.tip["do"] if self.tip else blinky.REPLUG_PLAIN)
+
+    def _log_round(self, text, good):
+        self.history_box.insertWidget(0, RoundRow(self.round, text, good,
+                                                  self.history))
+        while self.history_box.count() > self.HISTORY:
+            item = self.history_box.takeAt(self.history_box.count() - 1)
+            if item.widget():
+                item.widget().deleteLater()
+        self.history.show()
+        self.adjustSize()
+
+    # -- waiting for a replug -------------------------------------------------
+
+    def _await(self, do, start=None):
+        if self._closing:
+            return
+        self.todo.setText(do)
+        here = blinky.camera_present()
+        self.phase = start or ("unplug" if here else "plug")
+        self._say_phase()
+        self._poll.start(self.POLL_MS)
+        self.adjustSize()
+
+    def _say_phase(self):
+        self.pled.set_state("busy")
+        self.progress.setText({
+            "unplug": "Waiting for you to unplug it…",
+            "plug": "Unplugged. Plug it back in when you’re ready.",
+            "settle": "Plugged in. Giving it a moment to settle…",
+        }[self.phase])
+
+    def _tick(self):
+        here = blinky.camera_present()
+        self._show_where()
+        if self.phase == "unplug" and not here:
+            self.phase = "plug"
+            self._say_phase()
+            if self.round:
+                self.todo.setText("Plug it back in." if not self.tip
+                                  else self.tip["do"])
+        elif self.phase == "plug" and here:
+            self._poll.stop()
+            self.phase = "settle"
+            self._say_phase()
+            QTimer.singleShot(self.SETTLE_MS, self._settled)
+
+    def _settled(self):
+        if self.phase == "settle" and not self._closing:
+            self._start_round()
+
+    # -- remedies -------------------------------------------------------------
+
+    def _show_next_tip(self):
+        path, depth = blinky.camera_path()
+        tip = None
+        for st in blinky._recovery_ladder(None, path, depth):
+            key = st["title"]
+            if key in self._tips_shown or st.get("destructive"):
+                continue
+            # Draining happens every round, and a plain power-cycle is what
+            # every round already is.
+            if st["kind"] == "drain" or (st["kind"] == "replug"
+                                         and "ports" not in st
+                                         and "cable" not in key.lower()):
+                continue
+            tip = st
+            break
+        if tip is None:
+            self.tip = None
+            self.tipcard.title = "Still nothing"
+            self.tiptitle.setText("What is left is hardware.")
+            self.tipwhy.setText(
+                "A different computer, or the camera’s USB side has "
+                "failed. The photos saved so far are safe. You can keep "
+                "replugging; sometimes it still comes good.")
+            self.tipports.hide()
+            self.btn_tip.hide()
+        else:
+            self._tips_shown.add(tip["title"])
+            self.tip = tip
+            self.tipcard.title = "Nothing came through — try this"
+            self.tiptitle.setText(tip["title"].replace(" (needs sudo)", ""))
+            self.tipwhy.setText(tip.get("reason") or tip["why"])
+            if "ports" in tip:
+                self.tipports.setText(ports_html(tip["ports"]))
+                self.tipports.show()
+            else:
+                self.tipports.hide()
+            self.btn_tip.setVisible(tip["kind"] == "quirks")
+            self.btn_tip.setEnabled(True)
+        self.tipcard.update()
+        self.tipcard.show()
+        self.adjustSize()
+
+    def _hide_tip(self):
+        self.tip = None
+        self.tipcard.hide()
+        self.adjustSize()
+
+    def _set_quirks(self):
+        if not shutil.which("pkexec"):
+            self.tipwhy.setText(
+                "Run these in a terminal, then replug:\n"
+                "  echo '%s' | sudo tee %s\n  echo 1 | sudo tee %s"
+                % (blinky.quirks_value(), blinky.QUIRKS_PARAM,
+                   blinky.OLD_SCHEME_PARAM))
+            self.btn_tip.hide()
+            return
+        import subprocess
+        self.btn_tip.setEnabled(False)
+        try:
+            # pkexec puts up the desktop's own password prompt and blocks
+            # until it is answered, so keep the dialog painting meanwhile.
+            p = subprocess.Popen(["pkexec", "sh", "-c", blinky.quirks_script()],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT)
+        except OSError as exc:
+            self.tipwhy.setText("Could not ask for your password: %s" % exc)
+            self.btn_tip.setEnabled(True)
+            return
+        self._pk = p
+        self._pk_timer = QTimer(self)
+        self._pk_timer.timeout.connect(self._quirks_poll)
+        self._pk_timer.start(200)
+
+    def _quirks_poll(self):
+        rc = self._pk.poll()
+        if rc is None:
+            return
+        self._pk_timer.stop()
+        if rc == 0 and blinky.quirks_applied():
+            self.tipwhy.setText("Set. They take effect when it is next "
+                                "plugged in, and last until you reboot.")
+            self.btn_tip.hide()
+            if self.sink is not None:
+                self.sink("out", "Kernel settings applied for the camera; "
+                                 "they last until the next reboot.")
+            return
+        self.btn_tip.setEnabled(True)
+        if rc in (126, 127):
+            self.tipwhy.setText("Not set: the password prompt was cancelled. "
+                                "Press Set Them to try again.")
+        else:
+            out = self._pk.stdout.read().decode("utf-8", "replace")
+            self.tipwhy.setText("Not set: %s" % _first_line(out or "rc %d"
+                                                            % rc))
+
+    # -- the end ---------------------------------------------------------------
+
+    def _finish(self, headline, body):
+        self._poll.stop()
+        self.phase = "done"
+        self.outcome = "done"
+        self.led.set_state("ok")
+        self.state.setText(headline)
+        self.detail.setText("Done in one go" if self.round <= 1 else
+                            "Took %d rounds of replugging" % self.round)
+        self.meter.set_value(1.0)
+        self.card.title = "Done"
+        self.card.update()
+        self.todo.setText(body)
+        self.pled.set_state("ok")
+        self.progress.setText("You can unplug the camera whenever you like.")
+        self._hide_tip()
+        self.btn_close.hide()
+        self.btn_done.show()
+        self.adjustSize()
+
+    def done(self, code):
+        if self.outcome is None and self.saved:
+            self.outcome = "partial"
+        self._poll.stop()
+        super().done(code)
+
+    def _pretty(self, path):
+        home = os.path.expanduser("~")
+        return path.replace(home, "~", 1) if path.startswith(home) else path
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(r, 7, 7)
+        p.save()
+        p.setClipPath(path)
+        paint_pinstripes(p, self.rect())
+        p.restore()
+        p.setPen(QPen(QColor("#4C6A8E"), 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+
+
 class BlinkyWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -1258,6 +2023,13 @@ class BlinkyWindow(QWidget):
         lay.setContentsMargins(15, 14, 15, 14)
         lay.setSpacing(13)
 
+        # Appears only when GitHub has a newer release than this one.
+        self.update_bar = Balloon("info", "Update", kind="blue", parent=self)
+        self.update_bar.clicked.connect(self._update_clicked)
+        lay.addWidget(self.update_bar)
+        self._release = None
+        self._update_job = None
+
         # -- Camera -------------------------------------------------------
         cam = LunaGroup("Camera", self)
         head = QHBoxLayout()
@@ -1291,6 +2063,15 @@ class BlinkyWindow(QWidget):
         head.addLayout(btns)
         cam.addLayout(head)
         lay.addWidget(cam)
+
+        # Appears only when the camera has the failure that recovery is for.
+        self.rescue = Balloon(
+            "warn", "Recover\u2026",
+            "Recovery walks you through unplugging and replugging, saving "
+            "more each time, until everything is off the camera.",
+            parent=self)
+        self.rescue.clicked.connect(self.run_recovery)
+        lay.addWidget(self.rescue)
 
         # -- Photos -------------------------------------------------------
         shots = LunaGroup("Photos on the camera", self)
@@ -1432,6 +2213,9 @@ class BlinkyWindow(QWidget):
         self.grip.raise_()
 
         self._sync_service()
+        # A background attempt from the last half hour still counts: the
+        # notification may be why the window was opened.
+        self._watch_seen = time.time() - 1800
         # Notice the camera coming and going without being asked to look.
         self._present = None
         self._watchdog = QTimer(self)
@@ -1440,6 +2224,12 @@ class BlinkyWindow(QWidget):
 
         self.set_busy(False)
         QTimer.singleShot(250, self.refresh)
+        # Look for a newer release shortly after opening, then twice a day
+        # for a window that is left open.
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self.check_for_update)
+        self._update_timer.start(12 * 3600 * 1000)
+        QTimer.singleShot(3000, self.check_for_update)
 
     def closeEvent(self, e):
         # A worker still talking to the camera must not be torn down under
@@ -1517,6 +2307,7 @@ class BlinkyWindow(QWidget):
         """Keep the window honest about whether the camera is there."""
         if self.job is not None and self.job.isRunning():
             return
+        self._check_watch_status()
         here = blinky.camera_present()
         if here == self._present:
             return
@@ -1585,7 +2376,7 @@ class BlinkyWindow(QWidget):
 
     def set_busy(self, busy, caption=""):
         for b in (self.btn_check, self.btn_refresh, self.btn_download,
-                  self.btn_folder):
+                  self.btn_folder, self.rescue.button):
             b.setEnabled(not busy)
         if busy:
             self.bar.start()
@@ -1655,6 +2446,186 @@ class BlinkyWindow(QWidget):
         self.status.setText("Something went wrong")
         self.detail.setText(message.splitlines()[0][:96])
         self.log.append("error", message)
+        if is_link_trouble(getattr(self.sender(), "exc", None)):
+            self._offer_recovery("The camera is plugged in but is not "
+                                 "answering properly.")
+
+    # -- updating ---------------------------------------------------------
+
+    def check_for_update(self):
+        """Ask GitHub, quietly, whether a newer release exists."""
+        if self._update_job is not None and self._update_job.isRunning():
+            return
+        if self.update_bar.isVisible():
+            return                   # already offered, or mid-install
+        if os.environ.get("BLINKY_NO_UPDATE_CHECK"):
+            return
+
+        def work(job, log):
+            return blinky.latest_release(log)
+
+        job = Job(work, self)
+        # Being offline is not worth a line in the Activity panel.
+        job.ok.connect(self._update_checked)
+        self._update_job = job
+        job.start()
+
+    def _update_checked(self, result):
+        latest, info = result
+        if not latest or (blinky.version_tuple(latest)
+                          <= blinky.version_tuple(blinky.__version__)):
+            return
+        self._release = (latest, info)
+        self.update_bar.head.setText(
+            "Blinky %s is available \u2014 you have %s."
+            % (latest, blinky.__version__))
+        self.update_bar.body.setText(
+            release_highlight(info.get("body"))
+            or "Press Update to download and install it.")
+        self.update_bar.set_button("Update")
+        self.update_bar.show()
+        self.log.append("info", "Blinky %s is available. Press Update to "
+                                "install it." % latest)
+
+    def _update_clicked(self):
+        if self.update_bar.button.text == "Restart":
+            self._restart_app()
+            return
+        if self._release is None:
+            return
+        if self._update_job is not None and self._update_job.isRunning():
+            return
+        latest, info = self._release
+        self.update_bar.set_button("Updating\u2026", enabled=False)
+        self.update_bar.body.setText("Downloading and checking the package"
+                                     "\u2026")
+
+        def work(job, log):
+            import subprocess
+            # Refuse a release without checksums: this ends in a root
+            # install, and the window cannot ask "are you sure?" usefully.
+            deb, data = blinky.fetch_release_deb(info, log, require_sums=True)
+            folder = tempfile.mkdtemp(prefix="blinky-update-")
+            # apt fetches local packages as its own unprivileged user, and
+            # complains if it cannot read the folder.
+            os.chmod(folder, 0o755)
+            path = os.path.join(folder, deb)
+            blinky.write_file_atomically(path, data)
+            os.chmod(path, 0o644)
+            if not shutil.which("pkexec"):
+                return None, path, ""
+            job.step.emit(0.0, "Waiting for your password\u2026")
+            p = subprocess.run(["pkexec", "apt-get", "install", "-y", path],
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT)
+            return p.returncode, path, p.stdout.decode("utf-8", "replace")
+
+        job = Job(work, self)
+        job.line.connect(self.log.append)
+        job.step.connect(lambda _f, caption:
+                         self.update_bar.body.setText(caption))
+        job.ok.connect(lambda r, latest=latest: self._update_done(latest, r))
+        job.failed.connect(self._update_failed)
+        self._update_job = job
+        job.start()
+
+    def _update_done(self, latest, result):
+        rc, path, out = result
+        if rc is None:
+            self.update_bar.body.setText(
+                "Downloaded and verified, but this system has no pkexec to "
+                "ask for your password. Install it with: sudo apt install %s"
+                % path)
+            self.update_bar.set_button("Update")
+            return
+        if rc != 0:
+            for line in out.strip().splitlines()[-6:]:
+                self.log.append("info", "   " + line)
+            self.update_bar.body.setText(
+                "Not installed: the password prompt was cancelled."
+                if rc in (126, 127) else
+                "Not installed: apt-get exited %d. Details are in the "
+                "Activity panel." % rc)
+            self.update_bar.set_button("Update")
+            return
+        # The background service is still running the old code; let it pick
+        # up the new one (a no-op when it is not running).
+        _systemctl("try-restart", WATCH_UNIT)
+        self.update_bar.head.setText("Blinky %s is installed." % latest)
+        self.update_bar.body.setText("Restart the window to start using it.")
+        self.update_bar.set_button("Restart")
+        self.log.append("out", "Installed Blinky %s." % latest)
+
+    def _update_failed(self, message):
+        self.update_bar.body.setText("Not installed: %s"
+                                     % message.splitlines()[0][:120])
+        self.update_bar.set_button("Update")
+        self.log.append("error", message)
+
+    def _restart_app(self):
+        """Close this window and open the newly installed one."""
+        from PyQt6.QtCore import QProcess
+        argv = list(sys.argv)
+        if not self.close():
+            return
+        QProcess.startDetached(sys.executable, argv)
+        QApplication.quit()
+
+    # -- recovery ---------------------------------------------------------
+
+    def _check_watch_status(self):
+        """Offer recovery when the background download drops out partway."""
+        st = blinky.read_watch_status()
+        if not st or st.get("time", 0) <= self._watch_seen:
+            return
+        self._watch_seen = st["time"]
+        result = st.get("result")
+        if result == "complete":
+            self.rescue.hide()
+        elif result in ("partial", "nothing"):
+            if st.get("total"):
+                head = ("The background download dropped out partway: %d of "
+                        "%d saved." % (st.get("saved") or 0, st["total"]))
+            else:
+                head = ("The background download could not get through to "
+                        "the camera.")
+            self._offer_recovery(head)
+
+    def _offer_recovery(self, headline):
+        self.rescue.head.setText(headline)
+        self.rescue.show()
+        self.log.append("warn", headline + " Press Recover\u2026 to get the "
+                                           "photos off a replug at a time.")
+
+    def run_recovery(self):
+        if self.job is not None and self.job.isRunning():
+            return
+        # Every replug would set off the background service and the window's
+        # own plug-in refresh, and both would fight the dialog for the camera.
+        paused = self._pause_service()
+        self._watchdog.stop()
+        self.set_busy(True, "Recovering\u2026")
+        self.log.append("info", "Recovery started.")
+        opts = dict(outdir=self.outdir, still_formats=self._chosen("still"),
+                    video_formats=self._chosen("video") or ("avi",),
+                    quality=92)
+        try:
+            outcome = RecoveryDialog(opts, self.log.append, self).run()
+        finally:
+            self.set_busy(False)
+            self._present = blinky.camera_present()
+            self._watchdog.start(2000)
+            self._paused_service = paused
+            self._resume_service()
+        if outcome == "done":
+            self.rescue.hide()
+            self.log.append("out", "Recovery finished: everything on the "
+                                   "camera is saved.")
+        else:
+            self.log.append("info", "Recovery stopped. Press Recover\u2026 "
+                                    "to pick up where it left off.")
+        if self._present:
+            self.refresh()
 
     # -- operations -------------------------------------------------------
 
@@ -1760,6 +2731,11 @@ class BlinkyWindow(QWidget):
                 self.log.append("warn", "Likely fix:")
                 for line in blinky._wrap(bad[0].fix)[:14]:
                     self.log.append("info", "   " + line)
+            kernel_trouble = any("USB trouble" in d for d in bad[0].detail)
+            if bad[0].number in (4, 5) or (bad[0].number == 1
+                                           and kernel_trouble):
+                self._offer_recovery("Check %d failed: %s."
+                                     % (bad[0].number, bad[0].title.lower()))
         else:
             self.led.set_state("ok")
             self.status.setText("All five checks passed")
@@ -1795,7 +2771,7 @@ class BlinkyWindow(QWidget):
             os.makedirs(rawdir, exist_ok=True)
             cam = blinky.Blink2(log)
             cam.open()
-            saved = failed = partial = 0
+            saved = failed = partial = dropped = 0
             states, verified, failures, skipped = {}, {}, [], []
             paths = {}
             index = blinky.local_fingerprints(outdir) if skip_dupes else {}
@@ -1809,20 +2785,15 @@ class BlinkyWindow(QWidget):
                 for i, e in enumerate(entries):
                     job.step.emit(i / len(entries), "Reading %s\u2026" % e.basename)
 
-                    if index and e.data_bytes in sizes:
-                        try:
-                            key = cam.fingerprint(e)
-                        except blinky.CameraError:
-                            key = None
-                        if key in index:
-                            log.out("%s: already saved as %s"
-                                    % (e.basename,
-                                       os.path.basename(index[key])))
-                            job.item.emit(i, "done")
-                            states[i] = "done"
-                            paths[i] = index[key]
-                            skipped.append(e.basename)
-                            continue
+                    known = already_saved(cam, e, index, sizes)
+                    if known:
+                        log.out("%s: already saved as %s"
+                                % (e.basename, os.path.basename(known)))
+                        job.item.emit(i, "done")
+                        states[i] = "done"
+                        paths[i] = known
+                        skipped.append(e.basename)
+                        continue
 
                     job.item.emit(i, "busy")
                     try:
@@ -1833,60 +2804,34 @@ class BlinkyWindow(QWidget):
                         states[i] = "failed"
                         failures.append((e.basename, str(exc)))
                         failed += 1
+                        dropped += 1
+                        if isinstance(exc, (blinky.NotPresent,
+                                            blinky.DeviceStalled,
+                                            blinky.PermissionDenied)):
+                            # Gone or wedged: every remaining read would fail
+                            # the same way, slowly. Recovery takes it from
+                            # here.
+                            dropped += len(entries) - i - 1
+                            log.error("stopping: the camera is no longer "
+                                      "usable")
+                            break
                         continue
 
-                    stem = "image%04d" % counter
+                    state, raw, problem = save_photo(
+                        data, e, "image%04d" % counter, outdir, dirs,
+                        still_formats, video_formats, quality, log)
                     counter += 1
-                    # free_path is a belt-and-braces guard: the counter
-                    # should already be past anything on disk, but
-                    # overwriting a photo is not a mistake worth risking.
-                    raw = blinky.free_path(os.path.join(rawdir, stem + ".raw"))
-                    stem = os.path.splitext(os.path.basename(raw))[0]
-                    blinky.write_file_atomically(raw, data)
                     paths[i] = raw
                     verified[i] = (raw, len(data),
                                    hashlib.sha256(data).hexdigest())
-
-                    # A clip of one frame is a photograph, so decide from the
-                    # bytes rather than the directory flag alone.
-                    is_clip = (e.is_movie
-                               and (blinky.movie_extension(data)[1]
-                                    or len(blinky.split_clip_frames(data)) > 1))
-                    if is_clip:
-                        try:
-                            n, w, h, made = blinky.build_clip(
-                                data, dirs, stem, log, video_formats)
-                            log.out("%s: %d frame%s at %dx%d -> %s"
-                                    % (e.basename, n, "" if n == 1 else "s",
-                                       w, h, ", ".join(
-                                           os.path.basename(m) for m in made)))
-                            job.item.emit(i, "done")
-                            states[i] = "done"
-                            saved += 1
-                        except blinky.CameraError as exc:
-                            log.error("%s: could not build a video: %s"
-                                      % (e.basename, exc))
-                            log.info("the camera's bytes are kept at %s" % raw)
-                            job.item.emit(i, "failed")
-                            states[i] = "failed"
-                            failures.append((e.basename, str(exc)))
-                            failed += 1
-                        continue
-                    try:
-                        w, h, raster, part = blinky.decode_still(data, log)
-                        blinky.write_still(outdir, stem, w, h, raster,
-                                           still_formats, quality)
-                        states[i] = "partial" if part else "done"
-                        job.item.emit(i, states[i])
-                        partial += 1 if part else 0
-                        saved += 1
-                    except blinky.CameraError as exc:
-                        log.error("%s: decode failed: %s" % (e.basename, exc))
-                        log.info("the raw data is kept at %s" % raw)
-                        job.item.emit(i, "failed")
-                        states[i] = "failed"
-                        failures.append((e.basename, "decode: %s" % exc))
+                    states[i] = state
+                    job.item.emit(i, state)
+                    if state == "failed":
+                        failures.append((e.basename, problem))
                         failed += 1
+                    else:
+                        saved += 1
+                        partial += 1 if state == "partial" else 0
                 job.step.emit(1.0, "")
 
                 erased = None
@@ -1897,7 +2842,7 @@ class BlinkyWindow(QWidget):
                         cam, log, entries, list(range(len(entries))),
                         verified, failures, skipped)
                     erased = (rc == 0)
-                return saved, failed, partial, states, erased, paths
+                return saved, failed, partial, states, erased, paths, dropped
             finally:
                 cam.close()
 
@@ -1907,7 +2852,13 @@ class BlinkyWindow(QWidget):
         self.start(work, self._downloaded, "Downloading\u2026")
 
     def _downloaded(self, result):
-        saved, failed, partial, states, erased, paths = result
+        saved, failed, partial, states, erased, paths, dropped = result
+        if dropped:
+            have = sum(1 for st in states.values() if st in ("done", "partial"))
+            self._offer_recovery("The camera dropped out partway: %d of %d "
+                                 "saved." % (have, len(self.entries)))
+        elif not failed:
+            self.rescue.hide()
         self.led.set_state("ok" if not failed else "bad")
         self.status.setText("Saved %d photo%s" % (saved, "" if saved == 1 else "s"))
         bits = ["%d saved" % saved]

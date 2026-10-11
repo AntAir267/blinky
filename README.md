@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.11-1_all.deb
+sudo apt install ./packaging/blinky_1.12-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -31,17 +31,26 @@ Uninstall with `sudo apt remove blinky`.
 
 ### Updating
 
-Once installed, blinky can fetch its own updates from the GitHub releases:
+The window looks for a newer release a few seconds after it opens (and twice
+a day if left open). When there is one, a blue bar says so with the first
+change from the release notes and an **Update** button. Pressing it downloads
+the package, checks it, and installs it through your desktop's own password
+prompt (`pkexec`); then **Restart** opens the new version. Set
+`BLINKY_NO_UPDATE_CHECK=1` to stop the window asking GitHub.
+
+From a terminal:
 
 ```bash
-blinky update            # is there a newer one?
-blinky update --install  # fetch it and run sudo apt install
+blinky update --check    # is there a newer one?
+blinky update --install  # fetch it, check it, and sudo apt install it
+blinky update            # fetch and check it only; prints the install command
 ```
 
-The download is checked against the `SHA256SUMS` published alongside it and
-refused if it does not match — installing a package is root-level trust, so a
-truncated or substituted file should stop before it reaches dpkg. Without
-`--install` nothing is installed; it just tells you the command.
+Either way the download is checked against the `SHA256SUMS` published
+alongside it and refused if it does not match — installing a package is
+root-level trust, so a truncated or substituted file should stop before it
+reaches dpkg. The window goes further and refuses a release that publishes no
+checksums at all.
 
 Releases are cut by tagging. Pushing a `v*` tag runs the test suite, builds
 the package, verifies it unpacks and runs, and publishes it with checksums.
@@ -332,6 +341,29 @@ ground. It notifies on the desktop when a download finishes or partially
 succeeds.
 
 ## When it will not talk
+
+When a download dies partway — the link drops, the camera vanishes from the
+bus — the window shows a yellow bar: *The camera dropped out partway: 19 of 41
+saved*, with a **Recover…** button. The same bar appears when the background
+service hits it, because the service leaves a note of each attempt in
+`~/.local/state/blinky/watch.json` for the window to read.
+
+Recovery is the routine that got 41 photos off a failing link: download until
+the link drops, unplug, plug back in, carry on from where it stopped, repeat
+until everything is saved. The dialog watches the bus, so all you do is the
+unplugging and plugging: it tells you when to unplug, notices when you have,
+tells you to plug back in, and starts the next round by itself. Each round
+skips what is already saved by content, so nothing is fetched twice, and stops
+at the first photo that will not come through instead of spending minutes
+failing the rest. A running score and a history of rounds show it gaining
+ground.
+
+When a round gets nothing, it suggests the next remedy: the kernel quirks
+(with a button that asks for your password), then a port with fewer hubs —
+listing the free ones, best first — then another cable. It never suggests
+fresh batteries, because that erases the photos it is trying to save.
+
+From a terminal:
 
 ```bash
 blinky recover

@@ -1,4 +1,4 @@
-.TH BLINKY-GUI 1 "2026-09-18" "blinky 1.11" "User Commands"
+.TH BLINKY-GUI 1 "2026-09-18" "blinky 1.12" "User Commands"
 .SH NAME
 blinky\-gui \- window for the SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -28,5 +28,32 @@ would fail with EBUSY. Pressing Download therefore pauses the service for the
 duration and restarts it afterwards; closing the window mid-operation restarts
 it as well. The window also notices the camera being plugged in or removed on
 its own, so Refresh is rarely needed.
+.SH RECOVERY
+When a download dies partway, or the background service reports that one did,
+a yellow bar appears with a
+.B Recover
+button. Recovery repeats what works on a failing link: download until the link
+drops, unplug, plug back in, and carry on from where it stopped, until every
+photo is saved. The dialog watches the bus and starts each round by itself
+once the camera has been unplugged and plugged back in. Each round skips what
+is already saved, by content, and stops at the first photo that will not come
+through.
+.PP
+A round that gets nothing brings a suggestion: the kernel quirks (applied
+through
+.BR pkexec (1)),
+then a port with fewer hubs, then another cable. Fresh batteries are never
+suggested, because removing them erases the photos being recovered.
+.SH UPDATING
+A few seconds after opening, and twice a day after that, the window asks
+GitHub whether a newer release exists, and if so shows an
+.B Update
+button. It downloads the package, verifies it against the release's
+SHA256SUMS, and installs it with
+.BR pkexec (1)
+.BR apt\-get (8);
+a release without checksums is refused. Set
+.B BLINKY_NO_UPDATE_CHECK=1
+to turn the check off.
 .SH SEE ALSO
 .BR blinky (1)

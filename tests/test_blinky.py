@@ -16,6 +16,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.dirname(HERE))
 
+# The background service leaves a status file for the window. Keep the
+# test run's out of the real one, or a test could raise the recovery button
+# in a Blinky window that is open on this desk.
+os.environ["XDG_STATE_HOME"] = tempfile.mkdtemp(prefix="blinky-state-")
+# Nor should a test window ask GitHub about releases behind the suite's back.
+os.environ["BLINKY_NO_UPDATE_CHECK"] = "1"
+
 from simcam import make_cam, make_jpeg, make_avi           # noqa: E402
 import usb.core                                  # noqa: E402
 import blinky                                    # noqa: E402
@@ -1229,6 +1236,14 @@ def test_watch(blobs):
     a, tmp, sim = run()
     rc, _ = quiet(blinky.cmd_watch, a, Log(quiet=True), blinky.RunState())
     check("an already-plugged camera is handled at once", rc == 0, rc)
+    st = blinky.read_watch_status() or {}
+    check("it leaves word for the window that it finished",
+          st.get("result") == "complete", st)
+    check("  with how much of the camera is saved",
+          st.get("total") == len(blobs) and st.get("saved") == len(blobs), st)
+    check("  in the state directory, not the photo folder",
+          blinky.watch_status_path().startswith(os.environ["XDG_STATE_HOME"]),
+          blinky.watch_status_path())
     shutil.rmtree(tmp)
 
     # Not tested here: a failing transfer then waiting for a replug. It
@@ -1383,6 +1398,334 @@ def test_recover_ladder():
           [h["depth"] for h in ports])
 
 
+def test_gui_recovery():
+    """Recovery is the replug-and-resume routine, driven by the bus."""
+    section("GUI: recovery saves a replug at a time until everything is off")
+    try:
+        import os as _os
+        import time as _time
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+
+    app = QApplication.instance() or QApplication([])
+
+    def pump(cond, timeout=15):
+        end = _time.monotonic() + timeout
+        while _time.monotonic() < end:
+            app.processEvents()
+            if cond():
+                return True
+            _time.sleep(0.01)
+        return False
+
+    blobs = [(make_jpeg(seed=s), False) for s in (3, 11, 19, 27, 35)]
+    cam, sim = make_cam(blobs)
+    bus = {"present": True, "budget": 2, "reads": 0}
+
+    saved = {}
+    for name in ("open", "read_image_with_retries"):
+        saved[name] = getattr(blinky.Blink2, name)
+    for name in ("camera_present", "camera_path", "_step_drain",
+                 "quirks_applied"):
+        saved[name] = getattr(blinky, name)
+
+    def fake_read(self, entry, retries=None):
+        bus["reads"] += 1
+        if bus["budget"] <= 0:
+            raise blinky.CameraError("simulated -71 (EPROTO)")
+        bus["budget"] -= 1
+        return saved["read_image_with_retries"](self, entry, retries)
+
+    blinky.Blink2.open = lambda self, handshake=True: (
+        setattr(self, "dev", cam.dev), setattr(self, "in_ep", cam.in_ep),
+        setattr(self, "max_packet", 64), self)[-1]
+    blinky.Blink2.read_image_with_retries = fake_read
+    blinky.camera_present = lambda: bus["present"]
+    blinky.camera_path = lambda: (("5-2", 0) if bus["present"]
+                                  else (None, None))
+    blinky._step_drain = lambda log: None
+    blinky.quirks_applied = lambda: False
+
+    outdir = tempfile.mkdtemp()
+    opts = dict(outdir=outdir, still_formats=("png",),
+                video_formats=("avi",), quality=92)
+    d = blinky_gui.RecoveryDialog(opts)
+    d.POLL_MS, d.SETTLE_MS = 20, 10
+    d.show()
+    d._begin()
+    tips = []
+
+    def replug(budget):
+        bus["present"] = False
+        check_ok = pump(lambda: d.phase == "plug")
+        bus["budget"] = budget
+        bus["present"] = True
+        return check_ok and pump(lambda: d.phase in ("unplug", "done")
+                                 and not (d.job and d.job.isRunning()))
+
+    try:
+        check("round 1 starts at once when the camera is already there",
+              pump(lambda: d.phase == "unplug"), d.phase)
+        check("  and saves what it can before the link dies",
+              d.saved == 2 and d.total == 5, (d.saved, d.total))
+        check("  the score says so", "2 of 5" in d.state.text(),
+              d.state.text())
+        check("  then asks for an unplug", "unplug" in d.progress.text(),
+              d.progress.text())
+        check("  no remedy is pushed after a round that made progress",
+              d.tipcard.isHidden())
+        reads_after_drop = bus["reads"]
+        check("  it stops at the first photo that will not come through",
+              reads_after_drop == 3, reads_after_drop)
+
+        check("unplugging is noticed and it asks for the plug back in",
+              replug(0))
+        check("a round that gets nothing suggests a remedy",
+              not d.tipcard.isHidden())
+        tips.append(d.tiptitle.text())
+        check("  the kernel settings first, when they are unset",
+              "kernel" in tips[-1].lower(), tips[-1])
+        check("  with a button that asks for the password",
+              not d.btn_tip.isHidden())
+
+        replug(0)
+        tips.append(d.tiptitle.text())
+        check("then the next remedy, not the same one again",
+              tips[-1] != tips[-2], tips)
+        check("  a camera on a root port is told about cables, not ports",
+              "cable" in tips[-1].lower(), tips[-1])
+        check("  and the next replug says to swap it",
+              "cable" in d.todo.text().lower(), d.todo.text())
+
+        replug(0)
+        tips.append(d.tiptitle.text())
+        check("out of remedies, it says what is left is hardware",
+              "hardware" in tips[-1].lower(), tips[-1])
+        check("never the batteries, which would erase the photos",
+              not any("batter" in t.lower() for t in tips), tips)
+
+        check("a good round finishes the job", replug(10))
+        check("  every photo is saved", d.saved == 5, d.saved)
+        check("  and it says so", "All 5" in d.state.text(), d.state.text())
+        check("  the outcome is reported to the window", d.outcome == "done",
+              d.outcome)
+        raws = [f for f in os.listdir(os.path.join(outdir, "raw"))
+                if f.endswith(".raw")]
+        pngs = [f for f in os.listdir(outdir) if f.endswith(".png")]
+        check("  nothing was fetched twice across the rounds",
+              len(raws) == 5 and len(pngs) == 5, (sorted(raws), sorted(pngs)))
+        check("  the round history is capped",
+              d.history_box.count() <= d.HISTORY, d.history_box.count())
+        d.accept()
+
+        # Closing part-way through is a partial outcome, not a success.
+        shutil.rmtree(outdir, ignore_errors=True)
+        outdir2 = tempfile.mkdtemp()
+        opts["outdir"] = outdir2
+        bus.update(present=True, budget=1)
+        d2 = blinky_gui.RecoveryDialog(opts)
+        d2.POLL_MS, d2.SETTLE_MS = 20, 10
+        d2.show()
+        d2._begin()
+        pump(lambda: d2.phase == "unplug")
+        d2.reject()
+        check("stopping part-way reports a partial outcome",
+              d2.outcome == "partial", d2.outcome)
+        shutil.rmtree(outdir2, ignore_errors=True)
+
+        # -- the window: the button appears only for this failure ---------
+        blinky_gui.BlinkyWindow.refresh = lambda self: None
+        w = blinky_gui.BlinkyWindow()
+        w.outdir = tempfile.mkdtemp()
+        check("no recovery button while nothing is wrong", w.rescue.isHidden())
+        entries, _, _ = cam.get_directory()
+        w.entries = entries
+        w._rebuild_rows()
+        w.eraseafter.setChecked(False)
+
+        bus.update(budget=1, gone=0)
+        real_fake = blinky.Blink2.read_image_with_retries
+
+        def gone_after_one(self, entry, retries=None):
+            if bus["budget"] <= 0:
+                bus["gone"] += 1
+                raise blinky.NotPresent("no SiPix Blink II found")
+            return real_fake(self, entry, retries)
+        blinky.Blink2.read_image_with_retries = gone_after_one
+        w.download()
+        w.job.wait(20000)
+        app.processEvents()
+        check("a download that loses the camera shows the recovery button",
+              not w.rescue.isHidden())
+        check("  saying how far it got", "1 of 5" in w.rescue.head.text(),
+              w.rescue.head.text())
+        check("  and it stops instead of failing every remaining photo",
+              bus["gone"] == 1, bus["gone"])
+
+        blinky.Blink2.read_image_with_retries = saved["read_image_with_retries"]
+        w.download()
+        w.job.wait(20000)
+        app.processEvents()
+        check("a complete download puts the button away", w.rescue.isHidden())
+
+        # The background service is what hits this when it is switched on,
+        # so its report has to raise the button too.
+        w.rescue.hide()
+        blinky.write_watch_status(Log(quiet=True), result="partial",
+                                  total=41, saved=19, gained=7, outdir="/x")
+        w._check_watch_status()
+        check("a partial background download shows the button",
+              not w.rescue.isHidden())
+        check("  with the service's own count",
+              "19 of 41" in w.rescue.head.text(), w.rescue.head.text())
+        w._check_watch_status()
+        w.rescue.hide()
+        w._check_watch_status()
+        check("  but the same report is not acted on twice",
+              w.rescue.isHidden())
+        _time.sleep(0.01)
+        blinky.write_watch_status(Log(quiet=True), result="complete",
+                                  total=41, saved=41, gained=22, outdir="/x")
+        w.rescue.show()
+        w._check_watch_status()
+        check("a complete background download puts it away",
+              w.rescue.isHidden())
+
+        class FakeJob:
+            pass
+        w.rescue.hide()
+        for exc, want in ((blinky.CameraError("timed out reading the "
+                                              "directory table"), True),
+                          (blinky.PermissionDenied("EACCES"), False),
+                          (blinky.DeviceBusy("held by gphoto2"), False),
+                          (blinky.NotPresent("not on the bus"), False)):
+            w.rescue.hide()
+            job = FakeJob()
+            job.exc = exc
+            w.sender = lambda job=job: job
+            w._on_failed(str(exc))
+            check("  %s %s the button" % (type(exc).__name__,
+                                          "shows" if want else "does not show"),
+                  w.rescue.isVisible() == want or
+                  (not w.rescue.isHidden()) == want)
+        shutil.rmtree(w.outdir, ignore_errors=True)
+    finally:
+        for name in ("open", "read_image_with_retries"):
+            setattr(blinky.Blink2, name, saved[name])
+        for name in ("camera_present", "camera_path", "_step_drain",
+                     "quirks_applied"):
+            setattr(blinky, name, saved[name])
+        shutil.rmtree(outdir, ignore_errors=True)
+
+
+def test_gui_update():
+    """The window can update itself, and never installs what it cannot verify."""
+    section("GUI: the Update button")
+    try:
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+    import json as _json
+    app = QApplication.instance() or QApplication([])
+    blinky_gui.BlinkyWindow.refresh = lambda self: None
+    w = blinky_gui.BlinkyWindow()
+    check("no update bar until a newer release is found",
+          w.update_bar.isHidden())
+
+    body = ("blinky (9.9-1) unstable; urgency=low\n\n"
+            "  * Recovery walks through replugging until every photo is\n"
+            "    saved.\n  * Something else.\n\n -- someone  date\n")
+    check("the notes boil down to their first change",
+          blinky_gui.release_highlight(body)
+          == "Recovery walks through replugging until every photo is saved.",
+          blinky_gui.release_highlight(body))
+
+    w._update_checked((blinky.__version__, {"body": body}))
+    check("the same version is not offered", w.update_bar.isHidden())
+    w._update_checked(("0.1", {"body": body}))
+    check("nor an older one", w.update_bar.isHidden())
+
+    deb = b"fake package bytes"
+    digest = __import__("hashlib").sha256(deb).hexdigest()
+    info = {"tag_name": "v9.9", "body": body, "assets": [
+        {"name": "blinky_9.9-1_all.deb", "size": len(deb),
+         "browser_download_url": "https://x/deb"},
+        {"name": "SHA256SUMS", "browser_download_url": "https://x/sums"}]}
+    w._update_checked(("9.9", info))
+    check("a newer release shows the bar", not w.update_bar.isHidden())
+    check("  naming both versions",
+          "9.9" in w.update_bar.head.text()
+          and blinky.__version__ in w.update_bar.head.text(),
+          w.update_bar.head.text())
+    check("  and what changed", "replugging" in w.update_bar.body.text(),
+          w.update_bar.body.text())
+
+    real_get, real_which = blinky._http_get, blinky_gui.shutil.which
+    sums = {"line": "%s  blinky_9.9-1_all.deb" % digest}
+
+    def get(url, log, accept=None, timeout=20, allow_404=False):
+        return deb if url.endswith("/deb") else sums["line"].encode()
+    blinky._http_get = get
+    # No pkexec, so the job stops after verifying instead of installing.
+    blinky_gui.shutil.which = lambda name: (None if name == "pkexec"
+                                            else real_which(name))
+    try:
+        w._update_clicked()
+        w._update_job.wait(10000)
+        app.processEvents()
+        check("a verified download without pkexec says how to install it",
+              "sudo apt install" in w.update_bar.body.text(),
+              w.update_bar.body.text())
+        landed = [t for t in w.update_bar.body.text().split()
+                  if t.endswith(".deb")]
+        check("  and the package it names is the verified one",
+              landed and open(landed[0], "rb").read() == deb, landed)
+
+        sums["line"] = "%s  blinky_9.9-1_all.deb" % ("0" * 64)
+        w._update_clicked()
+        w._update_job.wait(10000)
+        app.processEvents()
+        check("a checksum mismatch is refused",
+              "checksum mismatch" in w.update_bar.body.text(),
+              w.update_bar.body.text())
+
+        no_sums = dict(info, assets=info["assets"][:1])
+        w._release = ("9.9", no_sums)
+        w._update_clicked()
+        w._update_job.wait(10000)
+        app.processEvents()
+        check("a release without checksums is refused, not installed",
+              "SHA256SUMS" in w.update_bar.body.text(),
+              w.update_bar.body.text())
+    finally:
+        blinky._http_get, blinky_gui.shutil.which = real_get, real_which
+
+    ctl = []
+    real_ctl = blinky_gui._systemctl
+    blinky_gui._systemctl = lambda *a, **k: (ctl.append(a), (0, ""))[1]
+    try:
+        w._update_done("9.9", (126, "/tmp/x.deb", ""))
+        check("a cancelled password prompt says so and offers Update again",
+              "cancelled" in w.update_bar.body.text()
+              and w.update_bar.button.text == "Update",
+              w.update_bar.body.text())
+        w._update_done("9.9", (0, "/tmp/x.deb", "ok"))
+        check("a good install offers a restart",
+              w.update_bar.button.text == "Restart")
+        check("  and restarts the background service onto the new code",
+              ("try-restart", blinky_gui.WATCH_UNIT) in ctl, ctl)
+    finally:
+        blinky_gui._systemctl = real_ctl
+
+
 def test_tt_ranking():
     section("port ranking: depth, then translator type, then the rest")
 
@@ -1510,6 +1853,8 @@ def main():
     test_watch(blobs)
     test_gui_watch_toggle()
     test_recover_ladder()
+    test_gui_recovery()
+    test_gui_update()
     test_tt_ranking()
     test_misc()
 
