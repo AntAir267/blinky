@@ -1383,6 +1383,78 @@ def test_recover_ladder():
           [h["depth"] for h in ports])
 
 
+def test_tt_ranking():
+    section("port ranking: depth, then translator type, then the rest")
+
+    def hub(name, depth, tt, bus, speed=480.0, root=False, powered=True):
+        return {"name": name, "depth": depth, "tt": tt, "bus": bus,
+                "speed": speed, "root": root, "self_powered": powered,
+                "free": [1], "total": 4, "product": name}
+
+    fake = [
+        hub("8-1", 1, "superspeed", "8", speed=5000.0),   # USB 3 half
+        hub("3-1", 1, "single", "3"),
+        hub("9-1", 1, "multi", "9"),
+        hub("usb5", 0, "none", "5", root=True, powered=False),
+        hub("9-1.3", 2, "multi", "9"),
+        hub("usb7", 0, "none", "7", root=True, powered=False),
+    ]
+    real = blinky.usb_port_survey
+    blinky.usb_port_survey = lambda: [dict(h) for h in fake]
+    try:
+        order = [h["name"] for h in blinky.candidate_ports()]
+        check("SuperSpeed hub halves are not offered",
+              "8-1" not in order, order)
+        check("root ports come first", order[:2] in (["usb5", "usb7"],
+                                                     ["usb7", "usb5"]), order)
+        check("multi-TT beats single-TT at the same depth",
+              order.index("9-1") < order.index("3-1"), order)
+        check("depth beats translator type",
+              order.index("3-1") < order.index("9-1.3"), order)
+
+        # The regression: a fault logged on bus 5 must not push its root
+        # port below a hub elsewhere. It may only break the tie between roots.
+        order5 = [h["name"] for h in blinky.candidate_ports(failed_bus="5")]
+        check("a root port on the faulted bus still beats every hub",
+              order5.index("usb5") < order5.index("9-1"), order5)
+        check("the fault only breaks the tie between root ports",
+              order5.index("usb7") < order5.index("usb5"), order5)
+
+        advice = blinky.link_advice(failed_bus="5")
+        check("doctor labels multi-TT", "multi-TT" in advice)
+        check("doctor labels single TT", "single TT" in advice)
+        check("doctor no longer calls the faulted bus least likely to help",
+              "least likely to help" not in advice)
+        check("shallow_ports uses the same ranking",
+              [h["name"] for h in blinky.shallow_ports(limit=10)] == order,
+              ([h["name"] for h in blinky.shallow_ports(limit=10)], order))
+    finally:
+        blinky.usb_port_survey = real
+
+    check("port_summary for a root port", blinky.port_summary(
+        hub("usb5", 0, "none", "5", root=True)) == "no hub")
+    check("port_summary names the translator",
+          blinky.port_summary(hub("9-1", 1, "multi", "9")) ==
+          "1 hub deep, multi-TT")
+    check("and the shared one",
+          blinky.port_summary(hub("3-1", 1, "single", "3")) ==
+          "1 hub deep, single TT, shared")
+
+    # And against this machine's real hubs: the type must match sysfs.
+    for h in blinky.usb_port_survey():
+        if h["root"] or h["speed"] >= 5000:
+            continue
+        proto = blinky._read_sysfs(
+            os.path.join(blinky.SYSFS_USB, h["name"], "bDeviceProtocol"))
+        want = {"02": "multi", "01": "single"}.get(proto, "none")
+        if h["tt"] != want:
+            check("TT type matches bDeviceProtocol for %s" % h["name"], False,
+                  (h["tt"], proto))
+            break
+    else:
+        check("TT type matches bDeviceProtocol for every hub here", True)
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -1438,6 +1510,7 @@ def main():
     test_watch(blobs)
     test_gui_watch_toggle()
     test_recover_ladder()
+    test_tt_ranking()
     test_misc()
 
     print("\n%s" % ("-" * 60))

@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.10-1_all.deb
+sudo apt install ./packaging/blinky_1.11-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -399,7 +399,14 @@ and counts how many hubs sit between it and the controller — the camera is a
 full-speed device from 2002, so every high-speed hub in the way has to wrap
 its traffic in split transactions, and a chain of them is the most common way
 to make it unreachable. It then surveys sysfs for ports that are actually
-free, lists them shallowest first and hides the deep ones, skips SuperSpeed root hubs (a 12 Mbps full-speed camera cannot attach to
+free and ranks them: fewest hubs first, then by **transaction translator**.
+A 12 Mbps device on a 480 Mbps hub needs a translator to bridge the speeds; a
+*multi-TT* hub gives each port its own, a *single-TT* hub makes every
+full-speed device share one, and a root port needs none at all. So a hub can
+never beat a root port — it can only add translation. A USB 3 hub is really two
+hubs in one box, and a full-speed camera only ever uses its USB 2.0 half, so
+the SuperSpeed half is left out of the list rather than naming each physical
+port twice. The deep ports are hidden, skips SuperSpeed root hubs (a 12 Mbps full-speed camera cannot attach to
 one), flags external self-powered hubs, deprioritises the bus the failure
 happened on, and prints the two runtime kernel knobs worth trying —
 `usbcore.old_scheme_first=1`, which makes the kernel assign an address before

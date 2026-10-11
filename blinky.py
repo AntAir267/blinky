@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.10"
+__version__ = "1.11"
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -412,9 +412,25 @@ def usb_port_survey():
         # timing budget tightens at every hop, so depth is the single most
         # useful thing to know about a candidate port.
         depth = 0 if is_root else name.split("-", 1)[-1].count(".") + 1
+        # How a full-speed device on this hub's ports reaches the high-speed
+        # bus. bDeviceProtocol: 1 = one translator shared by every port,
+        # 2 = one per port. A root port needs none -- xHCI speaks full speed
+        # natively -- and neither does a hub that is itself full speed.
+        proto = _read_sysfs(os.path.join(base, "bDeviceProtocol"), "")
+        if is_root:
+            tt = "none"
+        elif speed >= 5000:
+            tt = "superspeed"
+        elif proto == "02":
+            tt = "multi"
+        elif proto == "01":
+            tt = "single"
+        else:
+            tt = "none"
         hubs.append({
             "name": name,
             "depth": depth,
+            "tt": tt,
             "bus": _read_sysfs(os.path.join(base, "busnum"), "?"),
             "product": _read_sysfs(os.path.join(base, "product"),
                                    "root hub" if is_root else "hub").strip(),
@@ -427,6 +443,50 @@ def usb_port_survey():
             "total": total,
         })
     return hubs
+
+
+# Lower is better. A root port needs no translator at all; a multi-TT hub
+# gives each port its own; a single-TT hub makes every full-speed device on it
+# share one. One of this camera's failures did sit behind a single-TT hub, but
+# four hubs deep, so that is suggestive rather than proof.
+TT_RANK = {"none": 0, "multi": 1, "single": 2}
+
+
+def candidate_ports(failed_bus=None):
+    """Free ports a full-speed camera can actually use, best first.
+
+    SuperSpeed hubs are left out entirely, not just SuperSpeed root hubs. A
+    USB 3 hub is two hubs in one box, and a 12 Mbps device plugged into it
+    enumerates on the USB 2.0 companion -- which the survey lists separately,
+    with its real translator type. Offering the SuperSpeed half too would
+    name each physical port twice and describe one of them wrongly.
+    """
+    out = [h for h in usb_port_survey()
+           if h["free"] and h["speed"] < 5000]
+    # Depth and translator type are properties of the hardware. "The last
+    # logged fault was on this bus" is circumstantial -- it was a worn cable,
+    # not the controller, the day this was learned -- so it only breaks ties.
+    # It used to be the first key, which ranked a root port that had just
+    # worked below a single-TT hub on another bus.
+    out.sort(key=lambda h: (h["depth"], TT_RANK.get(h["tt"], 3),
+                            failed_bus is not None
+                            and h["bus"] == str(failed_bus),
+                            not h["self_powered"]))
+    return out
+
+
+def port_summary(h):
+    """A short, honest description of what plugging in here means."""
+    if h["depth"] == 0:
+        return "no hub"
+    bits = ["%d hub%s deep" % (h["depth"], "" if h["depth"] == 1 else "s")]
+    if h["tt"] == "multi":
+        bits.append("multi-TT")
+    elif h["tt"] == "single":
+        bits.append("single TT, shared")
+    elif h["tt"] == "none":
+        bits.append("full-speed hub")
+    return ", ".join(bits)
 
 
 def bus_from_kernel_hits(hits):
@@ -469,16 +529,10 @@ def link_advice(failed_bus=None, failed_depth=None, failed_path=None):
         "ideally straight into the machine. Ports are listed shallowest "
         "first.",
     ]
-    # This camera is a full-speed (12 Mbps) device, so a SuperSpeed root hub
-    # is not somewhere it can ever attach; listing those would be noise.
-    candidates = [h for h in usb_port_survey()
-                  if h["free"] and not (h["root"] and h["speed"] >= 5000)]
-    # Shallowest first. Every hub between the camera and the controller adds
-    # a transaction translator and tightens the timing, and this camera is a
-    # full-speed device from 2002: it is the first thing to fall over.
-    candidates.sort(key=lambda h: (h["bus"] == str(failed_bus)
-                                   if failed_bus is not None else False,
-                                   h["depth"], not h["self_powered"]))
+    # Shallowest first, then by how good the translator is. Every hub
+    # between the camera and the controller adds a hop, and a translator
+    # shared across ports is worse than one per port.
+    candidates = candidate_ports(failed_bus)
     if candidates:
         # Anything several hubs down is the situation being escaped from, so
         # showing a dozen of them would be advice against itself.
@@ -495,10 +549,16 @@ def link_advice(failed_bus=None, failed_depth=None, failed_path=None):
             else:
                 tag.append("%d hubs deep, which this camera dislikes"
                            % h["depth"])
+            if h["tt"] == "multi":
+                tag.append("multi-TT: a translator per port")
+            elif h["tt"] == "single":
+                tag.append("single TT, shared by every port")
+            elif h["tt"] == "none" and not h["root"]:
+                tag.append("full-speed hub, no translator")
             if h["self_powered"]:
                 tag.append("self-powered")
             if failed_bus is not None and h["bus"] == str(failed_bus):
-                tag.append("same bus as the failure, so least likely to help")
+                tag.append("the last logged fault was on this bus")
             lines.append("     bus %s  %s  %s: port(s) %s%s"
                          % (h["bus"], h["name"], h["product"] or "hub",
                             ", ".join(str(p) for p in h["free"]),
@@ -2635,14 +2695,8 @@ def camera_path():
 
 
 def shallow_ports(limit=3):
-    """The least-hubbed free ports, as advice a person can act on."""
-    out = []
-    for h in usb_port_survey():
-        if not h["free"] or (h["root"] and h["speed"] >= 5000):
-            continue
-        out.append(h)
-    out.sort(key=lambda h: (h["depth"], not h["self_powered"]))
-    return out[:limit]
+    """The best free ports, as advice a person can act on."""
+    return candidate_ports()[:limit]
 
 
 def _await_change(log, settle=3.0, timeout=600):
@@ -2779,11 +2833,10 @@ def _recovery_ladder(args, path, depth):
                "transactions. ")
         ports = shallow_ports()
         if ports:
-            why += "Free ports, shallowest first: " + "; ".join(
-                "bus %s %s port(s) %s%s"
+            why += "Free ports, best first: " + "; ".join(
+                "bus %s %s port(s) %s (%s)"
                 % (h["bus"], h["name"], ", ".join(str(p) for p in h["free"]),
-                   " (no hub)" if h["depth"] == 0
-                   else " (%d hub deep)" % h["depth"])
+                   port_summary(h))
                 for h in ports)
         else:
             why += ("Nothing is free to move it to, so unplug something else "

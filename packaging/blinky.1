@@ -1,4 +1,4 @@
-.TH BLINKY 1 "2026-09-18" "blinky 1.10" "User Commands"
+.TH BLINKY 1 "2026-09-18" "blinky 1.11" "User Commands"
 .SH NAME
 blinky \- download and diagnose a SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -263,6 +263,13 @@ Rebuilding the container re-encodes each frame, which is a second lossy pass,
 so the camera's own bytes are kept in the raw folder and
 .B blinky decode
 can rebuild the video from them at any time.
+.SH "CHOOSING A PORT"
+When it suggests ports, blinky ranks them by the number of hubs in the way,
+then by transaction translator: a full-speed device on a high-speed hub needs
+one, a multi-TT hub provides one per port, a single-TT hub shares one across
+all of them, and a root port needs none. A hub therefore never beats a root
+port. USB 3 hubs are left out of the list: each contains a USB 2.0 hub, which
+is all a full-speed camera ever uses, and that is listed in its own right.
 .SH "THE CAMERA FORGETS"
 Pictures live in 8 MB of SDRAM, not flash, kept alive by the batteries. They
 survive being unplugged from USB, but a flat or removed battery erases

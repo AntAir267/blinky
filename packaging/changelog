@@ -1,3 +1,19 @@
+blinky (1.11-1) unstable; urgency=low
+
+  * Rank suggested ports by transaction translator as well as depth. A
+    full-speed device on a high-speed hub needs a translator; multi-TT hubs
+    give each port its own, single-TT hubs share one, and root ports need
+    none. Ports are labelled accordingly in doctor and recover.
+  * Stop offering the SuperSpeed half of USB 3 hubs. A full-speed camera
+    plugged into one enumerates on its USB 2.0 companion, which is listed
+    separately with its real translator type.
+  * Demote "the last fault was on this bus" from the first sort key to a
+    tiebreaker. It had ranked a root port that had just worked below a
+    single-TT hub on another bus, on the strength of an old fault that was
+    caused by a cable.
+
+ -- antair <antairdo@gmail.com>  Sat, 10 Oct 2026 21:10:00 +0000
+
 blinky (1.10-1) unstable; urgency=low
 
   * Add `blinky recover`, which works the problem instead of describing it.
