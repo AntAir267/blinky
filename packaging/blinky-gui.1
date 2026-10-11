@@ -1,4 +1,4 @@
-.TH BLINKY-GUI 1 "2026-09-18" "blinky 1.8" "User Commands"
+.TH BLINKY-GUI 1 "2026-09-18" "blinky 1.9" "User Commands"
 .SH NAME
 blinky\-gui \- window for the SiPix StyleCam Blink II camera
 .SH SYNOPSIS
@@ -16,5 +16,17 @@ decode them.
 Requires PyQt6. On Debian and Ubuntu that is the
 .B python3\-pyqt6
 package.
+.SH "AUTOMATIC DOWNLOADING"
+The window carries a tick box for the background service described under
+.B watch
+in
+.BR blinky (1),
+so it can be turned on without a terminal, and shows whether it is running.
+.PP
+Both cannot use the camera at once, since each would claim interface 0 and one
+would fail with EBUSY. Pressing Download therefore pauses the service for the
+duration and restarts it afterwards; closing the window mid-operation restarts
+it as well. The window also notices the camera being plugged in or removed on
+its own, so Refresh is rarely needed.
 .SH SEE ALSO
 .BR blinky (1)

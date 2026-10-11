@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.8-1_all.deb
+sudo apt install ./packaging/blinky_1.9-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -309,6 +309,18 @@ byte-identical data, so the damage is on the device, not on the wire.
 blinky watch                                  # until you stop it
 systemctl --user enable --now blinky-watch    # from login, every time
 ```
+
+In the window there is a **Download automatically whenever the camera is
+plugged in** tick box that controls the same service, so it can be turned on
+without touching a terminal, and the window shows whether it is running.
+
+The two cannot both talk to the camera at once — they would each try to claim
+interface 0 and one would lose with `EBUSY` — so pressing Download in the
+window pauses the service, does the work, and restarts it afterwards. Closing
+the window mid-operation restarts it too, rather than leaving it stopped.
+
+The window also notices the camera arriving and leaving by itself, so there is
+no need to press Refresh.
 
 `watch` waits for the camera and downloads the moment it appears. This is the
 sane default for this hardware rather than a convenience: the pictures are in

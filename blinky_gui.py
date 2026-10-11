@@ -14,6 +14,7 @@ contains no protocol code.
 
 import hashlib
 import os
+import shutil
 import sys
 import time
 
@@ -1108,6 +1109,33 @@ class ActivityLog(QScrollArea):
         self.inner.setText("")
 
 
+WATCH_UNIT = "blinky-watch.service"
+
+
+def _systemctl(*args, timeout=6):
+    """Run systemctl --user. Returns (rc, output)."""
+    import subprocess
+    if shutil.which("systemctl") is None:
+        return 1, "systemctl is not available"
+    try:
+        p = subprocess.run(["systemctl", "--user"] + list(args),
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout)
+        return p.returncode, p.stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 1, str(exc)
+
+
+def watch_service_state():
+    """('missing'|'inactive'|'active', enabled) for the auto-download unit."""
+    rc, out = _systemctl("list-unit-files", WATCH_UNIT, "--no-legend")
+    if rc != 0 or WATCH_UNIT not in out:
+        return "missing", False
+    enabled = _systemctl("is-enabled", WATCH_UNIT)[1] == "enabled"
+    active = _systemctl("is-active", WATCH_UNIT)[1] == "active"
+    return ("active" if active else "inactive"), enabled
+
+
 class ConfirmDialog(QDialog):
     """A modal in the window's own idiom.
 
@@ -1200,8 +1228,14 @@ class BlinkyWindow(QWidget):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.Window)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMinimumSize(600, 780)
-        self.resize(600, 820)
+        # Fit the screen we actually have: this window is tall, and a
+        # laptop panel is often shorter than its natural height.
+        self.setMinimumSize(560, 520)
+        screen = QApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen else None
+        height = min(880, avail.height() - 60) if avail else 880
+        width = min(600, avail.width() - 40) if avail else 600
+        self.resize(max(560, width), max(520, height))
 
         self.outdir = blinky.DEFAULT_OUTDIR
         self.entries = []
@@ -1283,14 +1317,14 @@ class BlinkyWindow(QWidget):
         self.rowbox.addWidget(self.empty)
         self.rowbox.addStretch(1)
         self.scroll.setWidget(holder)
-        self.scroll.setMinimumHeight(190)
+        self.scroll.setMinimumHeight(110)
         shots.addWidget(self.scroll)
         lay.addWidget(shots, 1)
 
         # -- Activity -----------------------------------------------------
         act = LunaGroup("Activity", self)
         self.log = ActivityLog(self)
-        self.log.setMinimumHeight(104)
+        self.log.setMinimumHeight(62)
         act.addWidget(self.log)
         lay.addWidget(act)
 
@@ -1362,6 +1396,17 @@ class BlinkyWindow(QWidget):
         self.skipdupes = AquaCheck(
             "Skip photos already in this folder, even if renamed", True, self)
         opts.addWidget(self.skipdupes)
+
+        self.autodl = AquaCheck(
+            "Download automatically whenever the camera is plugged in",
+            False, self)
+        self.autodl.toggled.connect(self._auto_toggled)
+        opts.addWidget(self.autodl)
+        self.autonote = QLabel("")
+        self.autonote.setFont(ui_font(8))
+        self.autonote.setStyleSheet("color:#5B6C7D;")
+        self.autonote.setWordWrap(True)
+        opts.addWidget(self.autonote)
         self.eraseafter = AquaCheck(
             "Erase the camera after downloading", False, self, tint="warn")
         self.eraseafter.toggled.connect(self._erase_toggled)
@@ -1386,6 +1431,13 @@ class BlinkyWindow(QWidget):
         self.grip = ResizeGrip(self)
         self.grip.raise_()
 
+        self._sync_service()
+        # Notice the camera coming and going without being asked to look.
+        self._present = None
+        self._watchdog = QTimer(self)
+        self._watchdog.timeout.connect(self._poll_camera)
+        self._watchdog.start(2000)
+
         self.set_busy(False)
         QTimer.singleShot(250, self.refresh)
 
@@ -1395,6 +1447,9 @@ class BlinkyWindow(QWidget):
         job = getattr(self, "job", None)
         if job is not None and job.isRunning():
             job.wait(5000)
+        # Never leave the background downloader stopped because the window
+        # was closed mid-operation.
+        self._resume_service()
         super().closeEvent(e)
 
     def resizeEvent(self, e):
@@ -1424,6 +1479,62 @@ class BlinkyWindow(QWidget):
         p.setPen(QPen(QColor("#4C6A8E"), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPath(path)
+
+    def _sync_service(self):
+        """Reflect the background service's real state in the checkbox."""
+        state, enabled = watch_service_state()
+        self._service_state = state
+        blocked = self.autodl.blockSignals(True)
+        self.autodl.setChecked(state == "active")
+        self.autodl.blockSignals(blocked)
+        if state == "missing":
+            self.autodl.setEnabled(False)
+            self.autonote.setText(
+                "The background service is not installed, so this can only "
+                "download while the window is open.")
+        elif state == "active":
+            self.autonote.setText(
+                "Running in the background%s: plug the camera in and it "
+                "downloads by itself, window or no window."
+                % (" and at login" if enabled else ""))
+        else:
+            self.autonote.setText(
+                "Off. Downloads happen only when you press the button.")
+
+    def _auto_toggled(self, on):
+        if getattr(self, "_service_state", "missing") == "missing":
+            return
+        verb = ("enable", "--now") if on else ("disable", "--now")
+        rc, out = _systemctl(verb[0], verb[1], WATCH_UNIT)
+        if rc != 0:
+            self.log.append("error", "could not %s the background service: %s"
+                            % (verb[0], out))
+        self._sync_service()
+        self.log.append("info", "Automatic downloading is %s."
+                        % ("on" if self.autodl.isChecked() else "off"))
+
+    def _poll_camera(self):
+        """Keep the window honest about whether the camera is there."""
+        if self.job is not None and self.job.isRunning():
+            return
+        here = blinky.camera_present()
+        if here == self._present:
+            return
+        self._present = here
+        if here:
+            # Only look for ourselves if the service is not already on it.
+            if self._service_state == "active":
+                self.status.setText("Camera plugged in \u2014 the background "
+                                    "service is downloading")
+                self.led.set_state("busy")
+            else:
+                self.log.append("info", "Camera plugged in.")
+                self.refresh()
+        else:
+            self.led.set_state("unknown")
+            self.status.setText("No camera")
+            self.detail.setText("Plug the camera in.")
+            self._sync_service()
 
     def _toggle_zoom(self):
         if self.isMaximized():
@@ -1484,9 +1595,39 @@ class BlinkyWindow(QWidget):
         else:
             self.bar.stop()
 
+    def _pause_service(self):
+        """Stop the background downloader while we use the camera ourselves.
+
+        Both would claim interface 0 and one would lose with EBUSY, so they
+        must take turns. Returns True if it was running and we stopped it.
+        """
+        if getattr(self, "_service_state", "missing") != "active":
+            return False
+        rc, out = _systemctl("stop", WATCH_UNIT)
+        if rc != 0:
+            self.log.append("warn", "could not pause the background service "
+                                    "(%s); it may contend for the camera" % out)
+            return False
+        self.log.append("info", "Paused the background service while this "
+                                "window uses the camera.")
+        return True
+
+    def _resume_service(self):
+        if not getattr(self, "_paused_service", False):
+            return
+        self._paused_service = False
+        rc, out = _systemctl("start", WATCH_UNIT)
+        if rc != 0:
+            self.log.append("error", "could not restart the background "
+                                     "service: %s" % out)
+        else:
+            self.log.append("info", "Background service resumed.")
+        self._sync_service()
+
     def start(self, fn, on_ok, caption):
         if self.job is not None and self.job.isRunning():
             return
+        self._paused_service = self._pause_service()
         self.set_busy(True, caption)
         job = Job(fn, self)
         job.line.connect(self.log.append)
@@ -1495,6 +1636,7 @@ class BlinkyWindow(QWidget):
         job.ok.connect(on_ok)
         job.failed.connect(self._on_failed)
         job.finished.connect(lambda: self.set_busy(False))
+        job.finished.connect(self._resume_service)
         self.job = job
         job.start()
 

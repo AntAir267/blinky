@@ -1,3 +1,20 @@
+blinky (1.9-1) unstable; urgency=low
+
+  * The window can now turn automatic downloading on and off, controlling the
+    same background service as `blinky watch`, and shows whether it is
+    running and whether it starts at login.
+  * The window and the service take turns on the camera. Both would claim
+    interface 0 and one would fail with EBUSY, so pressing Download pauses
+    the service and restarts it afterwards; closing the window mid-operation
+    restarts it too, rather than leaving it stopped.
+  * The window notices the camera being plugged in or unplugged by itself,
+    so Refresh is rarely needed.
+  * Fit the window to the screen. Its natural height exceeded a 800px-tall
+    laptop panel, and the minimum size made it impossible to shrink; the
+    panels now compress and the initial size is taken from the screen.
+
+ -- antair <antairdo@gmail.com>  Fri, 10 Oct 2026 17:30:00 +0000
+
 blinky (1.8-1) unstable; urgency=low
 
   * Add `blinky watch`: wait for the camera and download the moment it

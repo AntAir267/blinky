@@ -30,7 +30,7 @@ import sys
 import tempfile
 import time
 
-__version__ = "1.8"
+__version__ = "1.9"
 
 # ---------------------------------------------------------------------------
 # Protocol constants

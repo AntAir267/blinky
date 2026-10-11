@@ -941,11 +941,15 @@ def test_gui_chrome():
     w2 = blinky_gui.BlinkyWindow()
     w2.show()
     app.processEvents()
-    w2.resize(680, 780)
+    # Comfortably above the minimum, so the resize is not clamped.
+    w2.resize(680, 900)
     app.processEvents()
     check("the resize grip tracks the window corner",
-          w2.grip.geometry().topLeft() == QPoint(680 - 18, 780 - 18),
+          w2.grip.geometry().topLeft() == QPoint(680 - 18, 900 - 18),
           w2.grip.geometry().topLeft())
+    # And the window must be able to fit a short screen.
+    check("the window can shrink to fit an 800px-tall panel",
+          w2.minimumHeight() <= 740, w2.minimumHeight())
 
     # An icon that renders blank is easy to ship and hard to notice.
     ink = []
@@ -1237,6 +1241,75 @@ def test_watch(blobs):
     blinky.camera_present, blinky.open_camera = real_present, real_open
 
 
+def test_gui_watch_toggle():
+    """The window and the background service must take turns on the camera."""
+    section("GUI: the automatic-download toggle")
+    try:
+        import os as _os
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+
+    app = QApplication.instance() or QApplication([])
+    blinky_gui.BlinkyWindow.refresh = lambda self: None
+    real_ctl = blinky_gui._systemctl
+    calls = []
+
+    def fake_ctl(*args, **kw):
+        calls.append(args)
+        if args[0] == "list-unit-files":
+            return 0, "%s enabled" % blinky_gui.WATCH_UNIT
+        if args[0] == "is-enabled":
+            return 0, fake_ctl.enabled
+        if args[0] == "is-active":
+            return 0, fake_ctl.active
+        return 0, ""
+    fake_ctl.enabled, fake_ctl.active = "enabled", "active"
+    blinky_gui._systemctl = fake_ctl
+
+    w = blinky_gui.BlinkyWindow()
+    w.outdir = tempfile.mkdtemp()
+    check("the toggle reflects a running service", w.autodl.isChecked())
+    check("and explains that it works without the window",
+          "window or no window" in w.autonote.text(), w.autonote.text())
+
+    # Manual use must stop the service, or both claim interface 0.
+    calls.clear()
+    paused = w._pause_service()
+    check("manual use pauses the background service", paused)
+    check("by actually stopping the unit",
+          any(c[0] == "stop" for c in calls), calls)
+    w._paused_service = True
+    calls.clear()
+    w._resume_service()
+    check("and restarts it afterwards",
+          any(c[0] == "start" for c in calls), calls)
+
+    # Nothing should happen when the service was never running.
+    fake_ctl.active = "inactive"
+    w._sync_service()
+    check("an inactive service leaves the toggle unchecked",
+          not w.autodl.isChecked())
+    calls.clear()
+    check("pausing an inactive service is a no-op", w._pause_service() is False)
+    check("and issues no systemctl stop",
+          not any(c[0] == "stop" for c in calls), calls)
+
+    # A missing unit must disable the toggle rather than fail oddly.
+    def no_unit(*args, **kw):
+        return (1, "") if args[0] == "list-unit-files" else (0, "")
+    blinky_gui._systemctl = no_unit
+    w._sync_service()
+    check("a missing unit disables the toggle", not w.autodl.isEnabled())
+    check("and says so", "not installed" in w.autonote.text(), w.autonote.text())
+
+    blinky_gui._systemctl = real_ctl
+    shutil.rmtree(w.outdir, ignore_errors=True)
+
+
 def test_misc():
     section("miscellaneous")
     real = blinky._run
@@ -1290,6 +1363,7 @@ def main():
     test_update()
     test_hub_depth()
     test_watch(blobs)
+    test_gui_watch_toggle()
     test_misc()
 
     print("\n%s" % ("-" * 60))
