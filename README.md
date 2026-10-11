@@ -13,7 +13,7 @@ and a built-in troubleshooter.
 
 ```bash
 ./packaging/build-deb.sh
-sudo apt install ./packaging/blinky_1.12-1_all.deb
+sudo apt install ./packaging/blinky_1.13-1_all.deb
 ```
 
 This installs `blinky` to `/usr/bin`, pulls in `python3-usb` and `python3-pil`,
@@ -191,6 +191,14 @@ everything, it refuses if anything failed, if `--images` selected only some
 photos (erasing would destroy the rest), or if any file fails to re-read from
 disk and match byte for byte what was transferred. Photos skipped because an
 identical copy was already in the folder count as accounted for.
+
+In the window, **Check & Erase…** does the same for photos that came off some
+other way — the background service never erases, and the erase box is easy to
+forget. It reads the camera, matches every photo against the folder by
+content, and erases only if each one has a copy; if any do not, it offers to
+download them first and erase once they verify. It checks again on the
+connection it erases over, so a photo that appears in between is never
+erased unsaved.
 
 ### Duplicate detection
 

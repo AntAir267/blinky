@@ -1132,13 +1132,53 @@ def _systemctl(*args, timeout=6):
 
 
 def watch_service_state():
-    """('missing'|'inactive'|'active', enabled) for the auto-download unit."""
+    """('missing'|'inactive'|'failed'|'active', enabled) for the unit."""
     rc, out = _systemctl("list-unit-files", WATCH_UNIT, "--no-legend")
     if rc != 0 or WATCH_UNIT not in out:
         return "missing", False
     enabled = _systemctl("is-enabled", WATCH_UNIT)[1] == "enabled"
-    active = _systemctl("is-active", WATCH_UNIT)[1] == "active"
-    return ("active" if active else "inactive"), enabled
+    active = _systemctl("is-active", WATCH_UNIT)[1]
+    if active == "active":
+        return "active", enabled
+    return ("failed" if active == "failed" else "inactive"), enabled
+
+
+def start_watch_service(verb="start"):
+    """Start (or restart) the unit, clearing a failed state first.
+
+    A unit systemd has given up on refuses to start until its failure is
+    reset, so a plain start would fail the same way every time.
+    """
+    rc, out = _systemctl(verb, WATCH_UNIT)
+    if rc != 0:
+        _systemctl("reset-failed", WATCH_UNIT)
+        rc, out = _systemctl(verb, WATCH_UNIT)
+    return rc, out
+
+
+def camera_inventory(cam, outdir, job=None):
+    """What is on the camera, and which of it is already saved in outdir.
+
+    Returns (entries, saved, missing): saved maps entry index to the local
+    file holding that photo, by content; missing lists indices with no copy.
+    A photo that cannot be fingerprinted counts as missing -- the safe side
+    to be wrong on when the answer decides whether to erase.
+    """
+    n = cam.get_numpics()
+    entries = cam.get_directory(n)[0] if n else []
+    index = blinky.local_fingerprints(outdir)
+    sizes = {sz for sz, _ in index}
+    saved, missing = {}, []
+    for i, e in enumerate(entries):
+        if job is not None:
+            job.step.emit(i / float(len(entries)), "Checking %s\u2026"
+                          % e.basename)
+        known = already_saved(cam, e, index, sizes)
+        if known:
+            saved[i] = known
+        else:
+            missing.append(i)
+    return entries, saved, missing
 
 
 class ConfirmDialog(QDialog):
@@ -2204,8 +2244,12 @@ class BlinkyWindow(QWidget):
         foot.setSpacing(10)
         self.bar = BarberPole(self)
         foot.addWidget(self.bar, 1)
+        self.btn_erase = GelButton("Check & Erase\u2026", "grey", self,
+                                   width=124)
+        self.btn_erase.clicked.connect(self.check_and_erase)
+        foot.addWidget(self.btn_erase)
         self.btn_download = GelButton("Download All", "blue", self, width=124)
-        self.btn_download.clicked.connect(self.download)
+        self.btn_download.clicked.connect(lambda: self.download())
         foot.addWidget(self.btn_download)
         lay.addLayout(foot)
 
@@ -2238,7 +2282,8 @@ class BlinkyWindow(QWidget):
         if job is not None and job.isRunning():
             job.wait(5000)
         # Never leave the background downloader stopped because the window
-        # was closed mid-operation.
+        # was closed mid-operation, or before its idle timer ran out.
+        self.job = None
         self._resume_service()
         super().closeEvent(e)
 
@@ -2287,6 +2332,11 @@ class BlinkyWindow(QWidget):
                 "Running in the background%s: plug the camera in and it "
                 "downloads by itself, window or no window."
                 % (" and at login" if enabled else ""))
+        elif state == "failed" and enabled:
+            self.autonote.setText(
+                "The background service stopped and systemd gave up "
+                "restarting it, so nothing is downloading by itself. Tick the "
+                "box to start it again.")
         else:
             self.autonote.setText(
                 "Off. Downloads happen only when you press the button.")
@@ -2295,6 +2345,11 @@ class BlinkyWindow(QWidget):
         if getattr(self, "_service_state", "missing") == "missing":
             return
         verb = ("enable", "--now") if on else ("disable", "--now")
+        if on:
+            # Pick up a unit file an update changed, and clear any failure
+            # systemd is holding against it, or the start is refused.
+            _systemctl("daemon-reload")
+            _systemctl("reset-failed", WATCH_UNIT)
         rc, out = _systemctl(verb[0], verb[1], WATCH_UNIT)
         if rc != 0:
             self.log.append("error", "could not %s the background service: %s"
@@ -2376,7 +2431,7 @@ class BlinkyWindow(QWidget):
 
     def set_busy(self, busy, caption=""):
         for b in (self.btn_check, self.btn_refresh, self.btn_download,
-                  self.btn_folder, self.rescue.button):
+                  self.btn_erase, self.btn_folder, self.rescue.button):
             b.setEnabled(not busy)
         if busy:
             self.bar.start()
@@ -2403,11 +2458,37 @@ class BlinkyWindow(QWidget):
                                 "window uses the camera.")
         return True
 
-    def _resume_service(self):
+    RESUME_DELAY_MS = 8000
+
+    def _schedule_resume(self):
+        """Restart the service once the window has been idle for a while.
+
+        Refresh, Download and Refresh again are three jobs in as many
+        seconds; stopping and starting the unit around each one is what
+        tripped systemd's start limit and killed the service. So stay paused
+        across a burst of work and resume once it is over.
+        """
         if not getattr(self, "_paused_service", False):
             return
+        if getattr(self, "_resume_timer", None) is None:
+            self._resume_timer = QTimer(self)
+            self._resume_timer.setSingleShot(True)
+            self._resume_timer.timeout.connect(self._resume_service)
+        self._resume_timer.start(self.RESUME_DELAY_MS)
+
+    def _cancel_resume(self):
+        timer = getattr(self, "_resume_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def _resume_service(self):
+        self._cancel_resume()
+        if not getattr(self, "_paused_service", False):
+            return
+        if self.job is not None and self.job.isRunning():
+            return                   # finished jobs schedule another try
         self._paused_service = False
-        rc, out = _systemctl("start", WATCH_UNIT)
+        rc, out = start_watch_service()
         if rc != 0:
             self.log.append("error", "could not restart the background "
                                      "service: %s" % out)
@@ -2418,7 +2499,9 @@ class BlinkyWindow(QWidget):
     def start(self, fn, on_ok, caption):
         if self.job is not None and self.job.isRunning():
             return
-        self._paused_service = self._pause_service()
+        self._cancel_resume()
+        if not getattr(self, "_paused_service", False):
+            self._paused_service = self._pause_service()
         self.set_busy(True, caption)
         job = Job(fn, self)
         job.line.connect(self.log.append)
@@ -2427,7 +2510,7 @@ class BlinkyWindow(QWidget):
         job.ok.connect(on_ok)
         job.failed.connect(self._on_failed)
         job.finished.connect(lambda: self.set_busy(False))
-        job.finished.connect(self._resume_service)
+        job.finished.connect(self._schedule_resume)
         self.job = job
         job.start()
 
@@ -2548,9 +2631,13 @@ class BlinkyWindow(QWidget):
                 "Activity panel." % rc)
             self.update_bar.set_button("Update")
             return
-        # The background service is still running the old code; let it pick
-        # up the new one (a no-op when it is not running).
-        _systemctl("try-restart", WATCH_UNIT)
+        # The background service is still running the old code, and the unit
+        # file itself may have changed. Reload, and if it is meant to be on,
+        # restart it -- which also revives it if systemd had given up on it.
+        _systemctl("daemon-reload")
+        if watch_service_state()[1]:
+            start_watch_service("restart")
+        self._sync_service()
         self.update_bar.head.setText("Blinky %s is installed." % latest)
         self.update_bar.body.setText("Restart the window to start using it.")
         self.update_bar.set_button("Restart")
@@ -2602,7 +2689,9 @@ class BlinkyWindow(QWidget):
             return
         # Every replug would set off the background service and the window's
         # own plug-in refresh, and both would fight the dialog for the camera.
-        paused = self._pause_service()
+        self._cancel_resume()
+        if not getattr(self, "_paused_service", False):
+            self._paused_service = self._pause_service()
         self._watchdog.stop()
         self.set_busy(True, "Recovering\u2026")
         self.log.append("info", "Recovery started.")
@@ -2615,8 +2704,7 @@ class BlinkyWindow(QWidget):
             self.set_busy(False)
             self._present = blinky.camera_present()
             self._watchdog.start(2000)
-            self._paused_service = paused
-            self._resume_service()
+            self._schedule_resume()
         if outcome == "done":
             self.rescue.hide()
             self.log.append("out", "Recovery finished: everything on the "
@@ -2749,12 +2837,113 @@ class BlinkyWindow(QWidget):
             self.destlabel.setText(self._pretty(chosen))
             self._rebuild_rows()
 
-    def download(self):
+    def check_and_erase(self):
+        """Clear the camera, but only once every photo is known to be saved.
+
+        For when the photos came off some other way -- the background service
+        never erases -- or the erase box was not ticked at the time.
+        """
+        outdir = self.outdir
+
+        def work(job, log):
+            cam = blinky.Blink2(log)
+            cam.open()
+            try:
+                return camera_inventory(cam, outdir, job)
+            finally:
+                cam.close()
+
+        self.log.append("info", "Checking that every photo on the camera is "
+                                "saved in %s\u2026" % self._pretty(outdir))
+        self.start(work, self._checked_for_erase, "Checking\u2026")
+
+    def _checked_for_erase(self, result):
+        entries, saved, missing = result
+        self.entries = entries
+        self.already_saved = dict(saved)
+        self._rebuild_rows()
+        if not entries:
+            self.led.set_state("ok")
+            self.status.setText("The camera is already empty")
+            self.log.append("out", "The camera is already empty.")
+            return
+        where = self._pretty(self.outdir)
+        if missing:
+            names = ", ".join(entries[i].basename for i in missing[:4])
+            if len(missing) > 4:
+                names += ", \u2026"
+            self.log.append("warn", "%d of %d photo%s on the camera %s not in "
+                                    "%s yet: %s" % (
+                                        len(missing), len(entries),
+                                        "" if len(entries) == 1 else "s",
+                                        "is" if len(missing) == 1 else "are",
+                                        where, names))
+            dlg = ConfirmDialog(
+                "Not everything is saved",
+                "%d of the %d photos on the camera %s not in %s yet (%s).\n\n"
+                "Download %s first? The camera is erased only once every "
+                "photo is verified on disk."
+                % (len(missing), len(entries),
+                   "is" if len(missing) == 1 else "are", where, names,
+                   "it" if len(missing) == 1 else "them"),
+                "Download Then Erase", self)
+            if dlg.ask():
+                self.download(erase=True, confirmed=True)
+            else:
+                self.log.append("info", "Nothing was erased.")
+            return
+
+        dlg = ConfirmDialog(
+            "Erase the camera?",
+            "All %d photo%s on the camera %s saved in %s.\n\nErasing removes "
+            "%s from the camera. The camera has no undo."
+            % (len(entries), "" if len(entries) == 1 else "s",
+               "is" if len(entries) == 1 else "are", where,
+               "it" if len(entries) == 1 else "them"),
+            "Erase Camera", self)
+        if not dlg.ask():
+            self.log.append("info", "Nothing was erased.")
+            return
+        outdir = self.outdir
+
+        def work(job, log):
+            cam = blinky.Blink2(log)
+            cam.open()
+            try:
+                # Check again on this connection, and let the same rules as
+                # erase-after-download decide: whatever changed since the
+                # dialog went up, nothing unsaved gets erased.
+                found, have, _ = camera_inventory(cam, outdir)
+                rc = blinky._delete_after_download(
+                    cam, log, found, list(range(len(found))), {}, [],
+                    [found[i].basename for i in have])
+                return rc == 0
+            finally:
+                cam.close()
+
+        self.start(work, self._erased, "Erasing\u2026")
+
+    def _erased(self, ok):
+        if ok:
+            self.entries = []
+            self.already_saved = {}
+            self._rebuild_rows()
+            self.led.set_state("ok")
+            self.status.setText("The camera is empty")
+            self.detail.setText("Everything was saved first.")
+            self.log.append("out", "Erased the camera.")
+        else:
+            self.led.set_state("bad")
+            self.status.setText("The camera was not erased")
+            self.log.append("warn", "The camera was left untouched; see the "
+                                    "lines above for why.")
+
+    def download(self, erase=None, confirmed=False):
         if not self.entries:
             self.log.append("warn", "Nothing to download. Press Refresh first.")
             return
-        erase = self.eraseafter.isChecked()
-        if erase and not self._confirm_erase(len(self.entries)):
+        erase = self.eraseafter.isChecked() if erase is None else erase
+        if erase and not confirmed and not self._confirm_erase(len(self.entries)):
             self.log.append("info", "Erase cancelled; nothing was downloaded.")
             return
 

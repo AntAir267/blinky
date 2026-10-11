@@ -1722,10 +1722,158 @@ def test_gui_update():
         w._update_done("9.9", (0, "/tmp/x.deb", "ok"))
         check("a good install offers a restart",
               w.update_bar.button.text == "Restart")
-        check("  and restarts the background service onto the new code",
-              ("try-restart", blinky_gui.WATCH_UNIT) in ctl, ctl)
+        check("  reloads the unit file, which may have changed",
+              ("daemon-reload",) in ctl, ctl)
     finally:
         blinky_gui._systemctl = real_ctl
+
+
+def test_gui_service_and_erase(blobs):
+    """The window must not kill the service it pauses, nor erase blind."""
+    section("GUI: pausing the service, and Check & Erase")
+    try:
+        import os as _os
+        import time as _time
+        _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+        import blinky_gui
+    except Exception as exc:
+        print("  (skipped: PyQt6 unavailable -- %s)" % str(exc)[:50])
+        return
+    app = QApplication.instance() or QApplication([])
+    blinky_gui.BlinkyWindow.refresh = lambda self: None
+
+    unit = {"active": "active", "start_fails": 0}
+    calls = []
+
+    def fake_ctl(*args, **kw):
+        calls.append(args)
+        if args[0] == "list-unit-files":
+            return 0, "%s enabled" % blinky_gui.WATCH_UNIT
+        if args[0] == "is-enabled":
+            return 0, "enabled"
+        if args[0] == "is-active":
+            return 0, unit["active"]
+        if args[0] in ("start", "restart") and unit["start_fails"]:
+            unit["start_fails"] -= 1
+            return 1, "start-limit-hit"
+        return 0, ""
+    real_ctl = blinky_gui._systemctl
+    blinky_gui._systemctl = fake_ctl
+    cam, sim = make_cam(blobs)
+    real_open = blinky.Blink2.open
+    blinky.Blink2.open = lambda self, handshake=True: (
+        setattr(self, "dev", cam.dev), setattr(self, "in_ep", cam.in_ep),
+        setattr(self, "max_packet", 64), self)[-1]
+    real_ask = blinky_gui.ConfirmDialog.ask
+    answers = []
+
+    def fake_ask(self):
+        answers.append(self.msg.text())
+        return fake_ask.answer
+    fake_ask.answer = True
+    blinky_gui.ConfirmDialog.ask = fake_ask
+
+    def run(w, fn):
+        fn()
+        if w.job is not None:
+            w.job.wait(20000)
+        app.processEvents()
+        app.processEvents()
+
+    try:
+        w = blinky_gui.BlinkyWindow()
+        w.RESUME_DELAY_MS = 150
+        w.outdir = tempfile.mkdtemp()
+
+        # A burst of jobs: one stop, no start until the window goes quiet.
+        calls.clear()
+        for _ in range(4):
+            run(w, lambda: w.start(lambda job, log: None, lambda r: None,
+                                   "work"))
+        stops = sum(1 for c in calls if c[0] == "stop")
+        starts = sum(1 for c in calls if c[0] == "start")
+        check("a burst of jobs stops the service once", stops == 1, calls)
+        check("  and does not start it between them", starts == 0, calls)
+        end = _time.monotonic() + 3
+        while _time.monotonic() < end and not any(c[0] == "start"
+                                                   for c in calls):
+            app.processEvents()
+            _time.sleep(0.02)
+        check("  it starts again once the window goes quiet",
+              sum(1 for c in calls if c[0] == "start") == 1, calls)
+
+        # A unit systemd has given up on needs its failure cleared first.
+        calls.clear()
+        unit["start_fails"] = 1
+        w._paused_service = True
+        w._resume_service()
+        check("a refused start is retried after reset-failed",
+              [c[0] for c in calls if c[0] in ("start", "reset-failed")]
+              == ["start", "reset-failed", "start"], calls)
+
+        unit["active"] = "failed"
+        w._sync_service()
+        check("a failed service shows as off, and says why",
+              not w.autodl.isChecked() and "gave up" in w.autonote.text(),
+              w.autonote.text())
+        calls.clear()
+        w.autodl.setChecked(True)
+        firsts = [c[0] for c in calls[:3]]
+        check("  ticking the box reloads and clears the failure first",
+              firsts == ["daemon-reload", "reset-failed", "enable"], calls)
+        unit["active"] = "inactive"
+        w._sync_service()
+
+        # -- Check & Erase ---------------------------------------------------
+        before = len(sim.blobs)
+        fake_ask.answer = False
+        answers.clear()
+        run(w, w.check_and_erase)
+        check("with nothing saved it asks to download first",
+              answers and "not in" in answers[-1], answers)
+        check("  and declining erases nothing", len(sim.blobs) == before,
+              len(sim.blobs))
+
+        fake_ask.answer = True
+        answers.clear()
+        run(w, w.check_and_erase)          # the check
+        if w.job is not None:              # Download Then Erase
+            w.job.wait(20000)
+        app.processEvents()
+        check("accepting downloads everything, then erases",
+              len(sim.blobs) == 0, len(sim.blobs))
+        raws = [f for f in os.listdir(os.path.join(w.outdir, "raw"))
+                if f.endswith(".raw")]
+        check("  with every photo on disk first", len(raws) == before, raws)
+
+        # Everything already saved: a straight confirm, then the erase.
+        sim.blobs = list(blobs)
+        sim.rebuild()
+        answers.clear()
+        run(w, w.check_and_erase)          # the check, then the erase job
+        if w.job is not None:
+            w.job.wait(20000)
+        app.processEvents()
+        check("when everything is saved it asks once, plainly",
+              len(answers) == 1 and "are saved in" in answers[0], answers)
+        check("  and erases the camera", len(sim.blobs) == 0, len(sim.blobs))
+        check("  without downloading anything again",
+              len([f for f in os.listdir(os.path.join(w.outdir, "raw"))
+                   if f.endswith(".raw")]) == before)
+        check("  and says so", "empty" in w.status.text(), w.status.text())
+
+        answers.clear()
+        run(w, w.check_and_erase)
+        check("an empty camera needs no confirmation",
+              answers == [] and "already empty" in w.status.text(),
+              (answers, w.status.text()))
+        shutil.rmtree(w.outdir, ignore_errors=True)
+        w._paused_service = False
+    finally:
+        blinky_gui._systemctl = real_ctl
+        blinky.Blink2.open = real_open
+        blinky_gui.ConfirmDialog.ask = real_ask
 
 
 def test_tt_ranking():
@@ -1857,6 +2005,7 @@ def main():
     test_recover_ladder()
     test_gui_recovery()
     test_gui_update()
+    test_gui_service_and_erase(blobs)
     test_tt_ranking()
     test_misc()
 

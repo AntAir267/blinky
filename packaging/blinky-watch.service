@@ -1,6 +1,12 @@
 [Unit]
 Description=Download photos from a SiPix Blink II whenever it is plugged in
 Documentation=man:blinky(1)
+# The Blinky window stops this service while it uses the camera itself and
+# starts it again afterwards, which can be several times in a few seconds.
+# systemd's default start limit (5 in 10s) reads that as a crash loop and
+# gives up on the unit for good. RestartSec below already keeps a genuine
+# crash from spinning, so the limit only ever did harm here.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

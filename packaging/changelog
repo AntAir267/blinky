@@ -1,3 +1,19 @@
+blinky (1.13-1) unstable; urgency=low
+
+  * Fix the background service dying when the window was used: the window
+    stopped and started it around every job, and a few jobs in quick
+    succession tripped systemd's start limit, after which it stayed dead.
+    The window now pauses it once for a burst of work and resumes it when
+    idle, the unit no longer has a start limit, and a refused start is
+    retried after clearing the failure.
+  * The window shows when systemd has given up on the service, and ticking
+    the box revives it. Installing an update reloads the unit and restarts
+    the service onto the new code.
+  * Check & Erase: clears the camera only once every photo on it is matched
+    to a saved copy, offering to download any that are missing first.
+
+ -- antair <antairdo@gmail.com>  Sun, 11 Oct 2026 17:20:00 +0000
+
 blinky (1.12-1) unstable; urgency=low
 
   * Recovery in the window: when a download dies partway, a Recover button
