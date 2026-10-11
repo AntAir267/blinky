@@ -2772,22 +2772,27 @@ def _recovery_ladder(args, path, depth):
     })
 
     if depth is None or depth > 0:
+        # The depth itself is the diagnosis, so say so even when no free port
+        # can be named: the answer may be to unplug something else.
+        why = ("This is a full-speed device from 2002, and every high-speed "
+               "hub between it and the controller wraps its traffic in split "
+               "transactions. ")
         ports = shallow_ports()
         if ports:
-            where = "; ".join(
-                "bus %s %s port(s) %s%s" % (h["bus"], h["name"],
-                                            ", ".join(str(p) for p in h["free"]),
-                                            " (no hub)" if h["depth"] == 0 else
-                                            " (%d hub deep)" % h["depth"])
+            why += "Free ports, shallowest first: " + "; ".join(
+                "bus %s %s port(s) %s%s"
+                % (h["bus"], h["name"], ", ".join(str(p) for p in h["free"]),
+                   " (no hub)" if h["depth"] == 0
+                   else " (%d hub deep)" % h["depth"])
                 for h in ports)
-            steps.append({
-                "title": "Move it to a port with fewer hubs in the way",
-                "why": "This is a full-speed device from 2002, and every "
-                       "high-speed hub between it and the controller wraps "
-                       "its traffic in split transactions. Free ports, "
-                       "shallowest first: %s" % where,
-                "act": lambda log: _step_replug(log, "somewhere shallower"),
-            })
+        else:
+            why += ("Nothing is free to move it to, so unplug something else "
+                    "from a port closer to the machine and use that.")
+        steps.append({
+            "title": "Move it to a port with fewer hubs in the way",
+            "why": why,
+            "act": lambda log: _step_replug(log, "somewhere shallower"),
+        })
 
     steps.append({
         "title": "Try a different USB cable",

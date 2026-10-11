@@ -1330,6 +1330,20 @@ def test_recover_ladder():
     check("a deep camera is told to move to a shallower port",
           any("fewer hubs" in t for t in titles), titles)
 
+    # CI has no free USB ports, and the rung used to vanish there -- taking
+    # the diagnosis with it. Depth is the finding; the port list is extra.
+    real_ports = blinky.shallow_ports
+    blinky.shallow_ports = lambda limit=3: []
+    bare = blinky._recovery_ladder(a, "9-1.3.3.3", 3)
+    blinky.shallow_ports = real_ports
+    check("the port rung survives having no free port to name",
+          any("fewer hubs" in st["title"] for st in bare),
+          [st["title"] for st in bare])
+    check("and says what to do instead",
+          any("unplug something else" in st["why"] for st in bare
+              if "fewer hubs" in st["title"]),
+          [st["why"][-60:] for st in bare if "fewer hubs" in st["title"]])
+
     shallow = [st["title"] for st in blinky._recovery_ladder(a, "5-2", 0)]
     check("a camera already on a root port is not told to move it",
           not any("fewer hubs" in t for t in shallow), shallow)
