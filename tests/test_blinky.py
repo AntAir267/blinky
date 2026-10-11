@@ -1688,6 +1688,8 @@ def test_gui_update():
                   if t.endswith(".deb")]
         check("  and the package it names is the verified one",
               landed and open(landed[0], "rb").read() == deb, landed)
+        for path in landed:
+            shutil.rmtree(os.path.dirname(path), ignore_errors=True)
 
         sums["line"] = "%s  blinky_9.9-1_all.deb" % ("0" * 64)
         w._update_clicked()
